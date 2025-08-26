@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import {
   ThemeProvider,
-  createTheme,
   CssBaseline,
   AppBar,
   Toolbar,
@@ -22,17 +21,6 @@ import {
   InputAdornment,
   IconButton,
   Chip,
-  Tooltip,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  Grid,
-  FormControl,
-  InputLabel,
-  Select,
-  MenuItem,
-  Snackbar,
   Button,
   Fab
 } from '@mui/material';
@@ -41,161 +29,17 @@ import {
   Refresh as RefreshIcon,
   Settings as SettingsIcon,
   Clear as ClearIcon,
-  Edit as EditIcon,
-  Delete as DeleteIcon,
-  Save as SaveIcon,
   Add as AddIcon,
   AdminPanelSettings as AdminIcon,
   Warning as WarningIcon
 } from '@mui/icons-material';
-
-const theme = createTheme({
-  palette: {
-    mode: 'light',
-    primary: {
-      main: '#1976d2',
-    },
-    secondary: {
-      main: '#dc004e',
-    },
-  },
-});
-
-const columns = [
-  { id: 'hive', label: 'Hive', minWidth: 60 },
-  { id: 'regView', label: 'View', minWidth: 60 },
-  { id: 'Rule', label: 'Rule Name', minWidth: 150 },
-  { id: 'ApplicationName', label: 'Application', minWidth: 200 },
-  { id: 'DSCPValue', label: 'DSCP', minWidth: 80 },
-  { id: 'ThrottleRate', label: 'Throttle Rate', minWidth: 120 },
-  { id: 'Protocol', label: 'Protocol', minWidth: 80 },
-  { id: 'LocalIP', label: 'Local IP', minWidth: 120 },
-  { id: 'LocalIPPrefixLength', label: 'Prefix', minWidth: 60 },
-  { id: 'LocalPort', label: 'Local Port', minWidth: 100 },
-  { id: 'RemoteIP', label: 'Remote IP', minWidth: 120 },
-  { id: 'RemoteIPPrefixLength', label: 'Prefix', minWidth: 60 },
-  { id: 'RemotePort', label: 'Remote Port', minWidth: 100 },
-  { id: 'actions', label: 'Actions', minWidth: 120 },
-];
-
-function formatPolicyValue(value, columnId) {
-  // Для regView показываем bit версию
-  if (columnId === 'regView') {
-    return <Chip label={`${value}-bit`} size="small" color={value === '64' ? 'primary' : 'secondary'} />;
-  }
-  
-  // Для DSCP показываем значение или пропускаем если не установлено
-  if (columnId === 'DSCPValue') {
-    // Конвертируем строку в число для проверки
-    const numValue = parseInt(value, 10);
-    if (!value || value === '' || numValue === 0 || isNaN(numValue)) {
-      return <Typography variant="body2" color="text.secondary">—</Typography>;
-    }
-    return <Chip label={`DSCP ${value}`} size="small" color="success" />;
-  }
-  
-  // Для ThrottleRate показываем значение с конвертацией в Mbps
-  if (columnId === 'ThrottleRate') {
-    // Конвертируем строку в число
-    const numValue = parseInt(value, 10);
-    if (!value || value === '' || numValue === -1 || numValue === 0 || isNaN(numValue)) {
-      return <Chip label="Unlimited" size="small" variant="outlined" color="success" />;
-    }
-    
-    // Конвертируем в Mbps если больше 1000 Kbps
-    if (numValue >= 1000) {
-      const mbps = numValue / 1000;
-      // Показываем с одним знаком после запятой если не целое число
-      const mbpsStr = mbps % 1 === 0 ? mbps.toString() : mbps.toFixed(1);
-      return <Chip label={`${mbpsStr} Mbps`} size="small" color="warning" />;
-    }
-    return <Chip label={`${numValue} Kbps`} size="small" color="warning" />;
-  }
-  
-  // Для портов и IP - показываем значение или пропускаем если Any
-  if (['LocalPort', 'RemotePort', 'LocalIP', 'RemoteIP'].includes(columnId)) {
-    if (!value || value === '0' || value === '' || value === '*') {
-      return <Typography variant="body2" color="text.secondary">—</Typography>;
-    }
-    return <Tooltip title={value}>
-      <span>{value}</span>
-    </Tooltip>;
-  }
-  
-  // Для протокола
-  if (columnId === 'Protocol') {
-    if (!value || value === '0' || value === '' || value === '*') {
-      return <Typography variant="body2" color="text.secondary">—</Typography>;
-    }
-    return <Chip label={value.toUpperCase()} size="small" color="info" />;
-  }
-  
-  // Для приложения
-  if (columnId === 'ApplicationName') {
-    if (!value || value === '' || value === '*') {
-      return <Typography variant="body2" color="text.secondary">—</Typography>;
-    }
-    // Показываем только имя файла для длинных путей
-    const fileName = value.split('\\').pop();
-    return (
-      <Tooltip title={value} arrow>
-        <span>{fileName}</span>
-      </Tooltip>
-    );
-  }
-  
-  // Для остальных полей
-  if (!value || value === '') {
-    return '—';
-  }
-  
-  return value;
-}
-
-function QoSPolicyRow({ policy, onEdit, onDelete, isAdmin }) {
-  return (
-    <TableRow hover>
-      {columns.map((column) => (
-        <TableCell key={column.id} style={{ minWidth: column.minWidth }}>
-          {column.id === 'actions' ? (
-            <Box sx={{ display: 'flex', gap: 1 }}>
-              <Tooltip title="Редактировать">
-                <IconButton 
-                  size="small" 
-                  onClick={() => onEdit(policy)} 
-                  color="primary"
-                  disabled={!isAdmin}
-                >
-                  <EditIcon fontSize="small" />
-                </IconButton>
-              </Tooltip>
-              <Tooltip title="Удалить">
-                <IconButton 
-                  size="small" 
-                  onClick={() => onDelete(policy)} 
-                  color="error"
-                  disabled={!isAdmin}
-                >
-                  <DeleteIcon fontSize="small" />
-                </IconButton>
-              </Tooltip>
-            </Box>
-          ) : (
-            <Tooltip 
-              title={column.id === 'Rule' ? policy.keyPath : ''} 
-              arrow
-              disableHoverListener={column.id !== 'Rule'}
-            >
-              <Box>
-                {formatPolicyValue(policy[column.id], column.id)}
-              </Box>
-            </Tooltip>
-          )}
-        </TableCell>
-      ))}
-    </TableRow>
-  );
-}
+import theme from './theme';
+import { columns } from './constants/columns';
+import QoSPolicyRow from './components/QoSPolicyRow';
+import EditPolicyDialog from './components/EditPolicyDialog';
+import CreatePolicyDialog from './components/CreatePolicyDialog';
+import DeletePolicyDialog from './components/DeletePolicyDialog';
+import NotificationSnackbar from './components/NotificationSnackbar';
 
 function App() {
   const [policies, setPolicies] = useState([]);
@@ -632,344 +476,38 @@ function App() {
           </Fab>
         )}
 
-        {/* Dialog для редактирования */}
-        <Dialog open={editDialogOpen} onClose={handleCloseEdit} maxWidth="md" fullWidth>
-          <DialogTitle>
-            Редактировать политику: {currentPolicy?.Rule}
-          </DialogTitle>
-          <DialogContent>
-            <Grid container spacing={2} sx={{ mt: 1 }}>
-              <Grid item xs={12}>
-                <TextField
-                  fullWidth
-                  label="Название правила"
-                  value={editForm.Rule || ''}
-                  disabled
-                  helperText="Название правила нельзя изменить"
-                />
-              </Grid>
-              <Grid item xs={12}>
-                <TextField
-                  fullWidth
-                  label="Приложение"
-                  value={editForm.ApplicationName || ''}
-                  onChange={(e) => handleFormChange('ApplicationName', e.target.value)}
-                  placeholder="Путь к приложению или * для всех"
-                  helperText="Полный путь к .exe файлу или * для всех приложений"
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="DSCP значение"
-                  type="number"
-                  value={editForm.DSCPValue || ''}
-                  onChange={(e) => handleFormChange('DSCPValue', e.target.value)}
-                  inputProps={{ min: 0, max: 63 }}
-                  helperText="0-63 (0 = любое)"
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Ограничение скорости"
-                  value={editForm.ThrottleRate || ''}
-                  onChange={(e) => handleFormChange('ThrottleRate', e.target.value)}
-                  helperText="Примеры: 15 Mbps, 1000 Kbps, -1 (неограничено)"
-                  placeholder="15 Mbps или 15360 Kbps"
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <FormControl fullWidth>
-                  <InputLabel>Протокол</InputLabel>
-                  <Select
-                    value={editForm.Protocol || '*'}
-                    label="Протокол"
-                    onChange={(e) => handleFormChange('Protocol', e.target.value)}
-                  >
-                    <MenuItem value="*">Любой</MenuItem>
-                    <MenuItem value="TCP">TCP</MenuItem>
-                    <MenuItem value="UDP">UDP</MenuItem>
-                    <MenuItem value="Both">TCP и UDP</MenuItem>
-                  </Select>
-                </FormControl>
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Локальный порт"
-                  value={editForm.LocalPort || ''}
-                  onChange={(e) => handleFormChange('LocalPort', e.target.value)}
-                  placeholder="* для любого или диапазон (80:443)"
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Локальный IP"
-                  value={editForm.LocalIP || ''}
-                  onChange={(e) => handleFormChange('LocalIP', e.target.value)}
-                  placeholder="* для любого"
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Префикс локального IP"
-                  type="number"
-                  value={editForm.LocalIPPrefixLength || ''}
-                  onChange={(e) => handleFormChange('LocalIPPrefixLength', e.target.value)}
-                  inputProps={{ min: 0, max: 32 }}
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Удаленный IP"
-                  value={editForm.RemoteIP || ''}
-                  onChange={(e) => handleFormChange('RemoteIP', e.target.value)}
-                  placeholder="* для любого"
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Префикс удаленного IP"
-                  type="number"
-                  value={editForm.RemoteIPPrefixLength || ''}
-                  onChange={(e) => handleFormChange('RemoteIPPrefixLength', e.target.value)}
-                  inputProps={{ min: 0, max: 32 }}
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Удаленный порт"
-                  value={editForm.RemotePort || ''}
-                  onChange={(e) => handleFormChange('RemotePort', e.target.value)}
-                  placeholder="* для любого или диапазон"
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Версия"
-                  value={editForm.Version || ''}
-                  onChange={(e) => handleFormChange('Version', e.target.value)}
-                />
-              </Grid>
-            </Grid>
-          </DialogContent>
-          <DialogActions>
-            <Button onClick={handleCloseEdit}>Отмена</Button>
-            <Button 
-              onClick={handleSave} 
-              variant="contained" 
-              disabled={saving}
-              startIcon={saving ? <CircularProgress size={16} /> : <SaveIcon />}
-            >
-              {saving ? 'Сохранение...' : 'Сохранить'}
-            </Button>
-          </DialogActions>
-        </Dialog>
+        <EditPolicyDialog
+          open={editDialogOpen}
+          policy={currentPolicy}
+          form={editForm}
+          onChange={handleFormChange}
+          onClose={handleCloseEdit}
+          onSave={handleSave}
+          saving={saving}
+        />
 
-        {/* Dialog для создания */}
-        <Dialog open={createDialogOpen} onClose={handleCloseCreate} maxWidth="md" fullWidth>
-          <DialogTitle>
-            Создать новую QoS политику
-          </DialogTitle>
-          <DialogContent>
-            <Grid container spacing={2} sx={{ mt: 1 }}>
-              <Grid item xs={12} sm={8}>
-                <TextField
-                  fullWidth
-                  label="Название правила"
-                  value={editForm.Rule || ''}
-                  onChange={(e) => handleFormChange('Rule', e.target.value)}
-                  required
-                  helperText="Уникальное имя для политики"
-                  error={!editForm.Rule}
-                />
-              </Grid>
-              <Grid item xs={12} sm={4}>
-                <FormControl fullWidth>
-                  <InputLabel>Реестр</InputLabel>
-                  <Select
-                    value={editForm.regView || '64'}
-                    label="Реестр"
-                    onChange={(e) => handleFormChange('regView', e.target.value)}
-                  >
-                    <MenuItem value="64">64-bit</MenuItem>
-                    <MenuItem value="32">32-bit</MenuItem>
-                  </Select>
-                </FormControl>
-              </Grid>
-              <Grid item xs={12}>
-                <TextField
-                  fullWidth
-                  label="Приложение"
-                  value={editForm.ApplicationName || ''}
-                  onChange={(e) => handleFormChange('ApplicationName', e.target.value)}
-                  placeholder="Путь к приложению или * для всех"
-                  helperText="Полный путь к .exe файлу или * для всех приложений"
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="DSCP значение"
-                  type="number"
-                  value={editForm.DSCPValue || ''}
-                  onChange={(e) => handleFormChange('DSCPValue', e.target.value)}
-                  inputProps={{ min: 0, max: 63 }}
-                  helperText="0-63 (0 = любое)"
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Ограничение скорости"
-                  value={editForm.ThrottleRate || ''}
-                  onChange={(e) => handleFormChange('ThrottleRate', e.target.value)}
-                  helperText="Примеры: 15 Mbps, 1000 Kbps, -1 (неограничено)"
-                  placeholder="15 Mbps или 15360 Kbps"
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <FormControl fullWidth>
-                  <InputLabel>Протокол</InputLabel>
-                  <Select
-                    value={editForm.Protocol || '*'}
-                    label="Протокол"
-                    onChange={(e) => handleFormChange('Protocol', e.target.value)}
-                  >
-                    <MenuItem value="*">Любой</MenuItem>
-                    <MenuItem value="TCP">TCP</MenuItem>
-                    <MenuItem value="UDP">UDP</MenuItem>
-                    <MenuItem value="Both">TCP и UDP</MenuItem>
-                  </Select>
-                </FormControl>
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Локальный порт"
-                  value={editForm.LocalPort || ''}
-                  onChange={(e) => handleFormChange('LocalPort', e.target.value)}
-                  placeholder="* для любого или диапазон"
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Локальный IP"
-                  value={editForm.LocalIP || ''}
-                  onChange={(e) => handleFormChange('LocalIP', e.target.value)}
-                  placeholder="* для любого"
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Префикс локального IP"
-                  type="number"
-                  value={editForm.LocalIPPrefixLength || ''}
-                  onChange={(e) => handleFormChange('LocalIPPrefixLength', e.target.value)}
-                  inputProps={{ min: 0, max: 32 }}
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Удаленный IP"
-                  value={editForm.RemoteIP || ''}
-                  onChange={(e) => handleFormChange('RemoteIP', e.target.value)}
-                  placeholder="* для любого"
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Префикс удаленного IP"
-                  type="number"
-                  value={editForm.RemoteIPPrefixLength || ''}
-                  onChange={(e) => handleFormChange('RemoteIPPrefixLength', e.target.value)}
-                  inputProps={{ min: 0, max: 32 }}
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Удаленный порт"
-                  value={editForm.RemotePort || ''}
-                  onChange={(e) => handleFormChange('RemotePort', e.target.value)}
-                  placeholder="* для любого или диапазон"
-                />
-              </Grid>
-              <Grid item xs={12} sm={6}>
-                <TextField
-                  fullWidth
-                  label="Версия"
-                  value={editForm.Version || ''}
-                  onChange={(e) => handleFormChange('Version', e.target.value)}
-                />
-              </Grid>
-            </Grid>
-          </DialogContent>
-          <DialogActions>
-            <Button onClick={handleCloseCreate}>Отмена</Button>
-            <Button 
-              onClick={handleSaveNew} 
-              variant="contained" 
-              disabled={saving || !editForm.Rule}
-              startIcon={saving ? <CircularProgress size={16} /> : <AddIcon />}
-            >
-              {saving ? 'Создание...' : 'Создать'}
-            </Button>
-          </DialogActions>
-        </Dialog>
+        <CreatePolicyDialog
+          open={createDialogOpen}
+          form={editForm}
+          onChange={handleFormChange}
+          onClose={handleCloseCreate}
+          onSave={handleSaveNew}
+          saving={saving}
+        />
 
-        {/* Dialog для подтверждения удаления */}
-        <Dialog open={deleteDialogOpen} onClose={handleCloseDelete}>
-          <DialogTitle>
-            Подтверждение удаления
-          </DialogTitle>
-          <DialogContent>
-            <Typography>
-              Вы действительно хотите удалить политику <strong>{currentPolicy?.Rule}</strong>?
-            </Typography>
-            <Typography variant="body2" color="textSecondary" sx={{ mt: 1 }}>
-              Это действие нельзя отменить.
-            </Typography>
-          </DialogContent>
-          <DialogActions>
-            <Button onClick={handleCloseDelete}>Отмена</Button>
-            <Button 
-              onClick={handleConfirmDelete} 
-              variant="contained" 
-              color="error"
-              disabled={saving}
-              startIcon={saving ? <CircularProgress size={16} /> : <DeleteIcon />}
-            >
-              {saving ? 'Удаление...' : 'Удалить'}
-            </Button>
-          </DialogActions>
-        </Dialog>
-
-        {/* Snackbar для уведомлений */}
-        <Snackbar
+        <DeletePolicyDialog
+          open={deleteDialogOpen}
+          policy={currentPolicy}
+          onClose={handleCloseDelete}
+          onConfirm={handleConfirmDelete}
+          saving={saving}
+        />
+        <NotificationSnackbar
           open={snackbar.open}
-          autoHideDuration={4000}
+          message={snackbar.message}
+          severity={snackbar.severity}
           onClose={handleCloseSnackbar}
-        >
-          <Alert 
-            onClose={handleCloseSnackbar} 
-            severity={snackbar.severity}
-            sx={{ width: '100%' }}
-          >
-            {snackbar.message}
-          </Alert>
-        </Snackbar>
+        />
       </Box>
     </ThemeProvider>
   );

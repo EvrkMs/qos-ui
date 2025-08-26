@@ -1,13 +1,15 @@
-// main.js — Electron main-process
-// Читает/пишет QoS-политики в реестр. Все значения отдаются СТРОКАМИ.
-// Используем native-reg; если он не доступен — fallback на reg.exe.
+// main.js — Electron main process
+// - Читает Policy-based QoS из HKLM/HKCU (native-reg, fallback reg.exe)
+// - IPC: get-policies, check-admin, create-policy, update-policy, delete-policy (как было)
+// - ДОБАВЛЕНО: open-qos-wizard (gpedit.msc), add-qos-policy-win (PowerShell New-NetQosPolicy)
 
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { exec } = require('child_process');
+const { exec, execFile } = require('child_process');
+const os = require('os');
 
-// ---------- Окно ----------
+// -------------------- Окно --------------------
 function createWindow() {
   const win = new BrowserWindow({
     width: 1200,
@@ -18,7 +20,6 @@ function createWindow() {
     }
   });
 
-  // Грузим dist/index.html если есть; иначе src/index.html (dev)
   const distHtml = path.join(__dirname, 'dist', 'index.html');
   const srcHtml  = path.join(__dirname, 'src', 'index.html');
   win.loadFile(fs.existsSync(distHtml) ? distHtml : srcHtml);
@@ -26,22 +27,15 @@ function createWindow() {
 
 app.whenReady().then(() => {
   createWindow();
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
-  });
+  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 
-// ---------- helpers ----------
+// -------------------- native-reg + helpers --------------------
 let nreg = null;
 try { nreg = require('native-reg'); } catch { nreg = null; }
 
-const HIVES = {
-  HKLM: 'HKLM',
-  HKCU: 'HKCU',
-};
+const HIVES = { HKLM: 'HKLM', HKCU: 'HKCU' };
 
 // Безопасно читаем REG_SZ как строку
 function readSzNative(hKey, valueName) {
@@ -61,7 +55,7 @@ function readSzNative(hKey, valueName) {
   }
 }
 
-function accessMask(view /* '64' | '32' */, write = false) {
+function accessMask(view /* '64'|'32' */, write = false) {
   const base = write ? nreg.Access.ALL_ACCESS : nreg.Access.READ;
   const wow  = (view === '64') ? nreg.Access.WOW64_64KEY : nreg.Access.WOW64_32KEY;
   return base | wow;
@@ -92,36 +86,33 @@ function readRuleNative(hive, view, rule) {
     regView: view,
     Rule: rule,
     keyPath: `${hive}\\Software\\Policies\\Microsoft\\Windows\\QoS\\${rule}`,
-    ApplicationName: readSzNative(hRule, 'Application Name'),
-    DSCPValue:       readSzNative(hRule, 'DSCP Value'),
-    ThrottleRate:    readSzNative(hRule, 'Throttle Rate'),
-    Protocol:        readSzNative(hRule, 'Protocol'),
-    LocalIP:         readSzNative(hRule, 'Local IP'),
-    LocalIPPrefixLength: readSzNative(hRule, 'Local IP Prefix Length'),
-    LocalPort:       readSzNative(hRule, 'Local Port'),
-    RemoteIP:        readSzNative(hRule, 'Remote IP'),
-    RemoteIPPrefixLength: readSzNative(hRule, 'Remote IP Prefix Length'),
-    RemotePort:      readSzNative(hRule, 'Remote Port'),
-    Version:         readSzNative(hRule, 'Version'),
+    ApplicationName:       readSzNative(hRule, 'Application Name'),
+    DSCPValue:             readSzNative(hRule, 'DSCP Value'),
+    ThrottleRate:          readSzNative(hRule, 'Throttle Rate'),
+    Protocol:              readSzNative(hRule, 'Protocol'),
+    LocalIP:               readSzNative(hRule, 'Local IP'),
+    LocalIPPrefixLength:   readSzNative(hRule, 'Local IP Prefix Length'),
+    LocalPort:             readSzNative(hRule, 'Local Port'),
+    RemoteIP:              readSzNative(hRule, 'Remote IP'),
+    RemoteIPPrefixLength:  readSzNative(hRule, 'Remote IP Prefix Length'),
+    RemotePort:            readSzNative(hRule, 'Remote Port'),
+    Version:               readSzNative(hRule, 'Version'),
   };
   nreg.closeKey(hRule);
   return obj;
 }
 
-// ---- Fallback на reg.exe ----
+// -------------------- Fallback: reg.exe --------------------
 function execReg(cmd) {
   return new Promise((resolve) => {
     exec(cmd, { windowsHide: true }, (err, stdout, stderr) => {
-      if (err) resolve({ ok: false, stdout, stderr: stderr || err.message });
-      else resolve({ ok: true, stdout, stderr: '' });
+      if (err) resolve({ ok: false, stdout: String(stdout||''), stderr: String(stderr || err.message) });
+      else     resolve({ ok: true,  stdout: String(stdout||''), stderr: '' });
     });
   });
 }
 
 function parseRegQuery(stdout) {
-  // Разбираем блоки вида:
-  // HKEY_...\QoS\Rule
-  //     ValueName   REG_SZ   Value
   const lines = String(stdout).split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   const res = [];
   let cur = null;
@@ -131,11 +122,7 @@ function parseRegQuery(stdout) {
       cur = { path: line, values: {} };
     } else if (cur) {
       const m = line.match(/^(.+?)\s+REG_[A-Z0-9]+\s+(.+)$/);
-      if (m) {
-        const name = m[1].trim();
-        const val  = m[2].trim();
-        cur.values[name] = val;
-      }
+      if (m) cur.values[m[1].trim()] = m[2].trim();
     }
   }
   if (cur) res.push(cur);
@@ -162,26 +149,25 @@ async function readRuleRegExe(hive, view, rule) {
     regView: view,
     Rule: rule,
     keyPath: key,
-    ApplicationName: v['Application Name'] || '',
-    DSCPValue: v['DSCP Value'] || '',
-    ThrottleRate: v['Throttle Rate'] || '',
-    Protocol: v['Protocol'] || '',
-    LocalIP: v['Local IP'] || '',
-    LocalIPPrefixLength: v['Local IP Prefix Length'] || '',
-    LocalPort: v['Local Port'] || '',
-    RemoteIP: v['Remote IP'] || '',
-    RemoteIPPrefixLength: v['Remote IP Prefix Length'] || '',
-    RemotePort: v['Remote Port'] || '',
-    Version: v['Version'] || ''
+    ApplicationName:       v['Application Name'] || '',
+    DSCPValue:             v['DSCP Value'] || '',
+    ThrottleRate:          v['Throttle Rate'] || '',
+    Protocol:              v['Protocol'] || '',
+    LocalIP:               v['Local IP'] || '',
+    LocalIPPrefixLength:   v['Local IP Prefix Length'] || '',
+    LocalPort:             v['Local Port'] || '',
+    RemoteIP:              v['Remote IP'] || '',
+    RemoteIPPrefixLength:  v['Remote IP Prefix Length'] || '',
+    RemotePort:            v['Remote Port'] || '',
+    Version:               v['Version'] || ''
   };
 }
 
-// ---- Общая обвязка чтения ----
+// -------------------- Обобщённое чтение --------------------
 async function collectPolicies() {
   const result = [];
   const hives = [HIVES.HKLM, HIVES.HKCU];
   const views = ['64', '32'];
-
   const useNative = !!nreg;
 
   for (const hive of hives) {
@@ -193,53 +179,28 @@ async function collectPolicies() {
           if (obj) result.push(obj);
         }
       } catch {
-        // проглатываем, просто идём дальше
+        // продолжаем дальше
       }
     }
   }
   return result;
 }
 
-// ---- Проверка админ-прав ----
-// Самый надёжный способ — попытка создать/удалить временный ключ в HKLM (требует админа).
-async function checkAdmin() {
-  // Сначала пробуем native-reg
-  if (nreg) {
-    try {
-      const root = nreg.openKey(nreg.HKLM, 'Software', accessMask('64', true));
-      if (root) {
-        const testName = 'qos_ui_admin_test_' + Date.now();
-        const h = nreg.createKey(root, testName, accessMask('64', true));
-        if (h) {
-          nreg.closeKey(h);
-          nreg.deleteKey(root, testName);
-          nreg.closeKey(root);
-          return true;
-        }
-        nreg.closeKey(root);
-      }
-    } catch { /* fallthrough */ }
-  }
-  // Fallback: "net session" возвращает "Access is denied" без админа
-  const out = await new Promise(resolve => {
-    exec('net session', { windowsHide: true }, (err) => resolve(!err));
+// -------------------- Админ-права --------------------
+async function isAdmin() {
+  return await new Promise(res => {
+    exec('net session', { windowsHide: true }, (err) => res(!err));
   });
-  return !!out;
 }
 
-// ---- Запись/создание/удаление ----
-// Универсальные функции: сначала native-reg, иначе reg.exe
-
+// -------------------- Запись/CRUD через реестр (как было) --------------------
 function strOr(val) { return (val === undefined || val === null) ? '' : String(val); }
 
 function writeValueNative(hive, view, rule, name, data) {
   const root = openRoot(hive, view, true);
   if (!root) throw new Error('Cannot open QoS root for write');
   let hRule = nreg.openKey(root, rule, accessMask(view, true));
-  if (!hRule) {
-    hRule = nreg.createKey(root, rule, accessMask(view, true));
-  }
-  // Пишем REG_SZ
+  if (!hRule) hRule = nreg.createKey(root, rule, accessMask(view, true));
   nreg.setValue(hRule, name, nreg.REG_SZ, String(data));
   nreg.closeKey(hRule);
   nreg.closeKey(root);
@@ -247,9 +208,7 @@ function writeValueNative(hive, view, rule, name, data) {
 
 async function writeValueRegExe(hive, view, rule, name, data) {
   const key = `${hive}\\Software\\Policies\\Microsoft\\Windows\\QoS\\${rule}`;
-  // Создаём подключ (тихий повторяемый)
   await execReg(`reg add "${key}" /f /reg:${view}`);
-  // Ставим REG_SZ
   const cmd = `reg add "${key}" /v "${name}" /t REG_SZ /d "${String(data)}" /f /reg:${view}`;
   const out = await execReg(cmd);
   if (!out.ok) throw new Error(out.stderr || 'reg add failed');
@@ -270,20 +229,17 @@ async function deleteKeyRegExe(hive, view, rule) {
   if (!out.ok) throw new Error(out.stderr || 'reg delete failed');
 }
 
-async function createOrUpdatePolicy(data, isCreate = false) {
-  // Ожидаем поля: Rule, regView ('64'|'32'), hive (optional, default HKLM), + все значения строками
-  const rule   = strOr(data.Rule).trim();
+async function createOrUpdatePolicy(data) {
+  const rule   = strOr(data.Rule || data.Name).trim();
   const view   = (data.regView === '32') ? '32' : '64';
   const hive   = (data.hive === 'HKCU') ? 'HKCU' : 'HKLM';
-
-  if (!rule) throw new Error('Имя правила (Rule) не задано');
+  if (!rule) throw new Error('Имя правила (Rule/Name) не задано');
 
   const writeKv = async (name, value) => {
     if (nreg) writeValueNative(hive, view, rule, name, strOr(value));
     else await writeValueRegExe(hive, view, rule, name, strOr(value));
   };
 
-  // Пишем только те значения, что пришли из формы (все — REG_SZ)
   const fields = {
     'Application Name': data.ApplicationName,
     'DSCP Value':       data.DSCPValue,
@@ -299,10 +255,7 @@ async function createOrUpdatePolicy(data, isCreate = false) {
   };
 
   for (const [k, v] of Object.entries(fields)) {
-    if (v !== undefined) {
-      // ВАЖНО: всегда строка
-      await writeKv(k, strOr(v));
-    }
+    if (v !== undefined) await writeKv(k, strOr(v));
   }
 
   return { ok: true };
@@ -319,45 +272,140 @@ async function deletePolicy({ Rule, regView, hive }) {
   return { ok: true };
 }
 
-// ---------- IPC ----------
-ipcMain.handle('get-policies', async () => {
-  try {
-    const items = await collectPolicies();
-    return { ok: true, items };
-  } catch (e) {
-    return { ok: false, error: String(e) };
+// -------------------- New: добавление через PowerShell --------------------
+function kbpsStringToBitsPerSecond(s) {
+  if (!s) return null;
+  const m = String(s).match(/-?\d+/);
+  if (!m) return null;
+  const kb = Number(m[0]);
+  if (!Number.isFinite(kb) || kb <= 0) return null;
+  // трактуем значение как "КБ/с" -> 1000 байт * 8 бит
+  return Math.round(kb * 1000 * 8);
+}
+
+function buildNewPolicyPs(p) {
+  // p: { Name, DSCPValue, ThrottleRate, ApplicationName, Protocol,
+  //      LocalIP, LocalIPPrefixLength, LocalPort,
+  //      RemoteIP, RemoteIPPrefixLength, RemotePort,
+  //      PolicyStore, NetworkProfile }
+  const lines = [];
+  lines.push(`$ErrorActionPreference='Stop'`);
+  lines.push(`Import-Module NetQos -ErrorAction Stop`);
+
+  const args = [];
+  args.push(`-Name "${p.Name}"`);
+  args.push(`-NetworkProfile ${p.NetworkProfile || 'All'}`);
+  args.push(`-PolicyStore ${p.PolicyStore || 'localhost'}`); // 'GPO:localhost' чтобы положить в Local GPO
+
+  if (p.DSCPValue && /^\d+$/.test(p.DSCPValue)) {
+    const dscp = Math.max(0, Math.min(63, parseInt(p.DSCPValue, 10)));
+    args.push(`-DSCPAction ${dscp}`);
   }
+  const bps = kbpsStringToBitsPerSecond(p.ThrottleRate);
+  if (bps) args.push(`-ThrottleRateActionBitsPerSecond ${bps}`);
+
+  if (p.ApplicationName && p.ApplicationName.trim())
+    args.push(`-AppPathNameMatchCondition "${p.ApplicationName.trim()}"`);
+
+  const proto = (p.Protocol || '').toUpperCase();
+  if (proto === 'TCP' || proto === 'UDP') args.push(`-IPProtocolMatchCondition ${proto}`);
+
+  // Если задан один порт (любая сторона) — используем общий матч
+  const port = [p.LocalPort, p.RemotePort].find(x => /^\d+$/.test(String(x||'')));
+  if (port) args.push(`-IPPortMatchCondition ${parseInt(port,10)}`);
+
+  if (p.LocalIP && p.LocalIPPrefixLength)   args.push(`-IPSrcPrefixMatchCondition "${p.LocalIP}/${p.LocalIPPrefixLength}"`);
+  if (p.RemoteIP && p.RemoteIPPrefixLength) args.push(`-IPDstPrefixMatchCondition "${p.RemoteIP}/${p.RemoteIPPrefixLength}"`);
+
+  lines.push(`New-NetQosPolicy ${args.join(' ')}`);
+  lines.push(`Get-NetQosPolicy -Name "${p.Name}" -PolicyStore ActiveStore | Format-List *`);
+  return lines.join(os.EOL);
+}
+
+function runPowershellScript(psCode) {
+  return new Promise((resolve) => {
+    const tmp = path.join(os.tmpdir(), `qos_add_${Date.now()}.ps1`);
+    fs.writeFileSync(tmp, psCode, 'utf8');
+    execFile('powershell.exe',
+      ['-NoProfile','-ExecutionPolicy','Bypass','-File', tmp],
+      { windowsHide: true, timeout: 60_000 },
+      (err, stdout, stderr) => {
+        try { fs.unlinkSync(tmp); } catch {}
+        if (err) resolve({ ok:false, stdout:String(stdout||''), stderr:String(stderr||err.message) });
+        else     resolve({ ok:true,  stdout:String(stdout||''), stderr:String(stderr||'') });
+      });
+  });
+}
+
+// -------------------- IPC --------------------
+ipcMain.handle('get-policies', async () => {
+  try { return { ok: true, items: await collectPolicies() }; }
+  catch (e) { return { ok: false, error: String(e) }; }
 });
 
 ipcMain.handle('check-admin', async () => {
-  try {
-    const res = await checkAdmin();
-    return res;
-  } catch {
-    return false;
-  }
+  try { return await isAdmin(); }
+  catch { return false; }
 });
 
 ipcMain.handle('create-policy', async (_evt, data) => {
-  try {
-    return await createOrUpdatePolicy(data, true);
-  } catch (e) {
-    return { ok: false, error: String(e) };
-  }
+  try { return await createOrUpdatePolicy(data); }
+  catch (e) { return { ok: false, error: String(e) }; }
 });
 
 ipcMain.handle('update-policy', async (_evt, data) => {
+  try { return await createOrUpdatePolicy(data); }
+  catch (e) { return { ok: false, error: String(e) }; }
+});
+
+ipcMain.handle('delete-policy', async (_evt, { Rule, regView, hive }) => {
+  try { return await deletePolicy({ Rule, regView, hive }); }
+  catch (e) { return { ok: false, error: String(e) }; }
+});
+
+// --- NEW: открыть мастер Policy-based QoS
+ipcMain.handle('open-qos-wizard', async () => {
   try {
-    return await createOrUpdatePolicy(data, false);
+    exec('gpedit.msc', { windowsHide: true });
+    return { ok: true };
   } catch (e) {
     return { ok: false, error: String(e) };
   }
 });
 
-ipcMain.handle('delete-policy', async (_evt, { Rule, regView, hive }) => {
+// --- NEW: добавить правило через PowerShell New-NetQosPolicy
+ipcMain.handle('add-qos-policy-win', async (_evt, form) => {
   try {
-    return await deletePolicy({ Rule, regView, hive });
+    // Минимум — имя
+    if (!form || !form.Name) return { ok:false, error:'Не задано имя правила (Name).' };
+
+    // Требуются админ-права
+    const admin = await isAdmin();
+    if (!admin) return { ok:false, error:'Нужны права администратора. Запусти приложение от имени администратора.' };
+
+    const p = {
+      Name:               String(form.Name || form.Rule),
+      DSCPValue:          String(form.DSCPValue || ''),
+      ThrottleRate:       String(form.ThrottleRate || ''),
+      ApplicationName:    String(form.ApplicationName || ''),
+      Protocol:           String(form.Protocol || ''),
+      LocalIP:            String(form.LocalIP || ''),
+      LocalIPPrefixLength:String(form.LocalIPPrefixLength || ''),
+      LocalPort:          String(form.LocalPort || ''),
+      RemoteIP:           String(form.RemoteIP || ''),
+      RemoteIPPrefixLength:String(form.RemoteIPPrefixLength || ''),
+      RemotePort:         String(form.RemotePort || ''),
+      NetworkProfile:     String(form.NetworkProfile || 'All'),
+      // Чтобы правило отображалось именно в Local GPO (gpedit), можно передать из UI: 'GPO:localhost'
+      PolicyStore:        String(form.PolicyStore || 'localhost'),
+    };
+
+    const ps = buildNewPolicyPs(p);
+    const res = await runPowershellScript(ps);
+    if (!res.ok) return { ok:false, error: res.stderr || 'PowerShell error', stdout: res.stdout };
+
+    return { ok:true, stdout: res.stdout };
   } catch (e) {
-    return { ok: false, error: String(e) };
+    return { ok:false, error:String(e) };
   }
 });
