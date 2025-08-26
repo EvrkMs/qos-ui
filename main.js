@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
 const Store = require('electron-store');
 const reg = require('native-reg');
@@ -6,10 +6,32 @@ const reg = require('native-reg');
 // Создаем хранилище для настроек
 const store = new Store();
 
+// Примечание: Все QoS политики в Windows хранятся как строковые значения (REG_SZ),
+// даже числовые параметры как DSCP Value и Throttle Rate
+
+// Проверка прав администратора
+function isAdmin() {
+  try {
+    // Пробуем открыть защищенный ключ для записи
+    const testKey = reg.openKey(
+      reg.HKLM,
+      'SOFTWARE',
+      reg.Access.READ | reg.Access.WOW64_64KEY
+    );
+    if (testKey) {
+      reg.closeKey(testKey);
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
 function createWindow() {
   // Получаем сохраненные размеры окна или используем дефолтные
   const windowBounds = store.get('windowBounds', {
-    width: 1200,
+    width: 1400,
     height: 800,
     x: undefined,
     y: undefined
@@ -24,7 +46,8 @@ function createWindow() {
       nodeIntegration: false,
       contextIsolation: true
     },
-    show: false // Не показываем окно пока не загрузится
+    icon: path.join(__dirname, 'icon.ico'), // если есть иконка
+    show: false
   });
 
   // Показываем окно когда оно готово
@@ -49,6 +72,16 @@ function createWindow() {
     win.webContents.openDevTools();
   }
 
+  // Проверяем права администратора
+  if (!isAdmin()) {
+    dialog.showMessageBoxSync(win, {
+      type: 'warning',
+      title: 'Требуются права администратора',
+      message: 'Для редактирования и удаления QoS политик требуются права администратора.\nЧтение политик доступно в обычном режиме.',
+      buttons: ['OK']
+    });
+  }
+
   return win;
 }
 
@@ -70,20 +103,30 @@ app.on('window-all-closed', () => {
 
 // --- QoS Registry helpers ---
 
-// Утилита: берёт значение (строкой) из открытого ключа; пустая строка, если нет
+// Получение строкового значения из реестра
 function getStr(hkey, valueName) {
   try {
     const val = reg.queryValue(hkey, valueName);
-    return reg.parseValue(val) ?? '';
+    const parsed = reg.parseValue(val);
+    return parsed !== null && parsed !== undefined ? String(parsed) : '';
   } catch {
     return '';
   }
 }
 
-// Функция для записи строкового значения в реестр
+// Запись строкового значения в реестр
 function setStr(hkey, valueName, value) {
   try {
-    reg.setValueSZ(hkey, valueName, String(value || ''));
+    // Если значение пустое или '*', удаляем параметр
+    if (!value || value === '*' || value === '') {
+      try {
+        reg.deleteValue(hkey, valueName);
+      } catch {
+        // Игнорируем ошибку если значения не существует
+      }
+      return true;
+    }
+    reg.setValueSZ(hkey, valueName, String(value));
     return true;
   } catch (e) {
     console.error(`Error setting ${valueName}:`, e);
@@ -91,10 +134,19 @@ function setStr(hkey, valueName, value) {
   }
 }
 
-// Функция для записи числового значения в реестр
+// Запись DWORD значения в реестр
 function setDWord(hkey, valueName, value) {
   try {
-    const numValue = parseInt(value, 10) || 0;
+    const numValue = parseInt(value, 10);
+    if (isNaN(numValue)) {
+      // Если не число, удаляем параметр
+      try {
+        reg.deleteValue(hkey, valueName);
+      } catch {
+        // Игнорируем ошибку если значения не существует
+      }
+      return true;
+    }
     reg.setValueDWORD(hkey, valueName, numValue);
     return true;
   } catch (e) {
@@ -103,20 +155,18 @@ function setDWord(hkey, valueName, value) {
   }
 }
 
-function openQoSRoot(view) {
-  // view: '64' | '32'
-  const access =
-    reg.Access.READ |
-    (view === '64' ? reg.Access.WOW64_64KEY : reg.Access.WOW64_32KEY);
-
+function openQoSRoot(view, access = reg.Access.READ) {
+  const flags = access | (view === '64' ? reg.Access.WOW64_64KEY : reg.Access.WOW64_32KEY);
+  
   try {
     const root = reg.openKey(
       reg.HKLM,
       'Software\\Policies\\Microsoft\\Windows\\QoS',
-      access
+      flags
     );
     return root;
-  } catch {
+  } catch (e) {
+    console.error(`Failed to open QoS root for view ${view}:`, e);
     return null;
   }
 }
@@ -129,46 +179,55 @@ async function collectQosPolicies() {
     if (!root) continue;
 
     try {
-      // Список правил = имена подключей под QoS
-      const ruleNames = reg.enumKeyNames(root);
+      // Получаем список подключей (правил QoS)
+      let ruleNames = [];
+      try {
+        ruleNames = reg.enumKeyNames(root);
+      } catch (e) {
+        console.error(`Failed to enumerate keys for view ${view}:`, e);
+        continue;
+      }
       
-      for (const rule of ruleNames) {
-        const access =
-          reg.Access.READ |
-          (view === '64' ? reg.Access.WOW64_64KEY : reg.Access.WOW64_32KEY);
+      for (const ruleName of ruleNames) {
+        const access = reg.Access.READ | (view === '64' ? reg.Access.WOW64_64KEY : reg.Access.WOW64_32KEY);
 
         try {
-          const hRule = reg.openKey(root, rule, access);
+          const hRule = reg.openKey(root, ruleName, access);
           if (!hRule) continue;
 
-          const item = {
+          // Читаем все параметры политики (все значения QoS хранятся как строки!)
+          const policy = {
             hive: 'HKLM',
             regView: view,
-            Rule: rule,
+            Rule: ruleName,
+            // Все параметры QoS политик хранятся как строковые значения
             ApplicationName: getStr(hRule, 'Application Name'),
-            DSCPValue: String(getStr(hRule, 'DSCP Value')),
-            ThrottleRate: String(getStr(hRule, 'Throttle Rate')),
+            DSCPValue: getStr(hRule, 'DSCP Value'),
+            ThrottleRate: getStr(hRule, 'Throttle Rate'),
             Protocol: getStr(hRule, 'Protocol'),
             LocalIP: getStr(hRule, 'Local IP'),
-            LocalIPPrefixLen: String(getStr(hRule, 'Local IP Prefix Length')),
+            LocalIPPrefixLength: getStr(hRule, 'Local IP Prefix Length'),
             LocalPort: getStr(hRule, 'Local Port'),
             RemoteIP: getStr(hRule, 'Remote IP'),
-            RemoteIPPrefixLen: String(getStr(hRule, 'Remote IP Prefix Length')),
+            RemoteIPPrefixLength: getStr(hRule, 'Remote IP Prefix Length'),
             RemotePort: getStr(hRule, 'Remote Port'),
             Version: getStr(hRule, 'Version'),
-            keyPath: `HKLM\\Software\\Policies\\Microsoft\\Windows\\QoS\\${rule}`
+            // Дополнительные поля для UI
+            keyPath: `HKLM\\Software\\Policies\\Microsoft\\Windows\\QoS\\${ruleName}`
           };
 
           reg.closeKey(hRule);
-          results.push(item);
+          results.push(policy);
         } catch (e) {
-          console.error(`Error reading rule ${rule}:`, e);
+          console.error(`Error reading rule ${ruleName}:`, e);
         }
       }
     } catch (e) {
-      console.error(`Error reading rules for view ${view}:`, e);
+      console.error(`Error processing QoS policies for view ${view}:`, e);
     } finally {
-      reg.closeKey(root);
+      if (root) {
+        reg.closeKey(root);
+      }
     }
   }
 
@@ -176,14 +235,20 @@ async function collectQosPolicies() {
 }
 
 async function updateQoSPolicy(policyData) {
+  if (!isAdmin()) {
+    throw new Error('Требуются права администратора для изменения политик');
+  }
+
   const view = policyData.regView || '64';
-  const access =
-    reg.Access.WRITE | reg.Access.READ |
+  const access = reg.Access.WRITE | reg.Access.READ |
     (view === '64' ? reg.Access.WOW64_64KEY : reg.Access.WOW64_32KEY);
+
+  let root = null;
+  let ruleKey = null;
 
   try {
     // Открываем корневой ключ QoS
-    const root = reg.openKey(
+    root = reg.openKey(
       reg.HKLM,
       'Software\\Policies\\Microsoft\\Windows\\QoS',
       access
@@ -193,46 +258,145 @@ async function updateQoSPolicy(policyData) {
       throw new Error('Не удается открыть раздел QoS для записи');
     }
 
-    // Открываем ключ правила
-    let ruleKey;
+    // Открываем или создаем ключ правила
     try {
       ruleKey = reg.openKey(root, policyData.Rule, access);
     } catch {
-      reg.closeKey(root);
-      throw new Error(`Не удается открыть ключ правила: ${policyData.Rule}`);
+      // Если ключ не существует, создаем его
+      try {
+        ruleKey = reg.createKey(root, policyData.Rule, access);
+      } catch (createError) {
+        throw new Error(`Не удается создать ключ правила: ${policyData.Rule}`);
+      }
     }
 
     if (!ruleKey) {
-      reg.closeKey(root);
-      throw new Error(`Ключ правила не существует: ${policyData.Rule}`);
+      throw new Error(`Не удается открыть или создать ключ правила: ${policyData.Rule}`);
     }
 
-    // Записываем значения
-    const updates = [
-      () => setStr(ruleKey, 'Application Name', policyData.ApplicationName || ''),
-      () => setDWord(ruleKey, 'DSCP Value', policyData.DSCPValue || 0),
-      () => setDWord(ruleKey, 'Throttle Rate', policyData.ThrottleRate || -1),
-      () => setStr(ruleKey, 'Protocol', policyData.Protocol || '*'),
-      () => setStr(ruleKey, 'Local IP', policyData.LocalIP || '*'),
-      () => setDWord(ruleKey, 'Local IP Prefix Length', policyData.LocalIPPrefixLen || 0),
-      () => setStr(ruleKey, 'Local Port', policyData.LocalPort || '*'),
-      () => setStr(ruleKey, 'Remote IP', policyData.RemoteIP || '*'),
-      () => setDWord(ruleKey, 'Remote IP Prefix Length', policyData.RemoteIPPrefixLen || 0),
-      () => setStr(ruleKey, 'Remote Port', policyData.RemotePort || '*'),
-      () => setStr(ruleKey, 'Version', policyData.Version || '1.0')
-    ];
+    // Записываем значения (все QoS параметры хранятся как строки!)
+    const updates = [];
+    
+    // Application Name - строковое значение
+    if (policyData.ApplicationName !== undefined) {
+      updates.push(setStr(ruleKey, 'Application Name', policyData.ApplicationName || '*'));
+    }
+    
+    // DSCP Value - числовое значение как строка (0-63)
+    if (policyData.DSCPValue !== undefined) {
+      const dscpVal = parseInt(policyData.DSCPValue, 10);
+      if (!isNaN(dscpVal) && dscpVal >= 0 && dscpVal <= 63) {
+        updates.push(setNumAsStr(ruleKey, 'DSCP Value', dscpVal));
+      } else {
+        updates.push(setNumAsStr(ruleKey, 'DSCP Value', 0));
+      }
+    }
+    
+    // Throttle Rate - числовое значение как строка (-1 для unlimited)
+    if (policyData.ThrottleRate !== undefined) {
+      const throttleVal = parseInt(policyData.ThrottleRate, 10);
+      updates.push(setNumAsStr(ruleKey, 'Throttle Rate', isNaN(throttleVal) ? -1 : throttleVal));
+    }
+    
+    // Protocol - строковое значение (TCP, UDP, или *)
+    if (policyData.Protocol !== undefined) {
+      updates.push(setStr(ruleKey, 'Protocol', policyData.Protocol || '*'));
+    }
+    
+    // Local IP - строковое значение
+    if (policyData.LocalIP !== undefined) {
+      updates.push(setStr(ruleKey, 'Local IP', policyData.LocalIP || '*'));
+    }
+    
+    // Local IP Prefix Length - числовое значение как строка
+    if (policyData.LocalIPPrefixLength !== undefined) {
+      updates.push(setNumAsStr(ruleKey, 'Local IP Prefix Length', policyData.LocalIPPrefixLength || 0));
+    }
+    
+    // Local Port - строковое значение или диапазон
+    if (policyData.LocalPort !== undefined) {
+      updates.push(setStr(ruleKey, 'Local Port', policyData.LocalPort || '*'));
+    }
+    
+    // Remote IP - строковое значение
+    if (policyData.RemoteIP !== undefined) {
+      updates.push(setStr(ruleKey, 'Remote IP', policyData.RemoteIP || '*'));
+    }
+    
+    // Remote IP Prefix Length - числовое значение как строка
+    if (policyData.RemoteIPPrefixLength !== undefined) {
+      updates.push(setNumAsStr(ruleKey, 'Remote IP Prefix Length', policyData.RemoteIPPrefixLength || 0));
+    }
+    
+    // Remote Port - строковое значение или диапазон
+    if (policyData.RemotePort !== undefined) {
+      updates.push(setStr(ruleKey, 'Remote Port', policyData.RemotePort || '*'));
+    }
+    
+    // Version - строковое значение
+    if (policyData.Version !== undefined) {
+      updates.push(setStr(ruleKey, 'Version', policyData.Version || '1.0'));
+    }
 
-    const results = updates.map(update => update());
-    const success = results.every(result => result);
-
-    reg.closeKey(ruleKey);
-    reg.closeKey(root);
+    const success = updates.every(result => result !== false);
 
     return success;
   } catch (e) {
     console.error('Error updating QoS policy:', e);
     throw e;
+  } finally {
+    if (ruleKey) reg.closeKey(ruleKey);
+    if (root) reg.closeKey(root);
   }
+}
+
+async function deleteQoSPolicy(ruleName, regView) {
+  if (!isAdmin()) {
+    throw new Error('Требуются права администратора для удаления политик');
+  }
+
+  const view = regView || '64';
+  const access = reg.Access.WRITE | reg.Access.READ |
+    (view === '64' ? reg.Access.WOW64_64KEY : reg.Access.WOW64_32KEY);
+
+  let root = null;
+
+  try {
+    // Открываем корневой ключ QoS
+    root = reg.openKey(
+      reg.HKLM,
+      'Software\\Policies\\Microsoft\\Windows\\QoS',
+      access
+    );
+
+    if (!root) {
+      throw new Error('Не удается открыть раздел QoS для удаления');
+    }
+
+    // Удаляем подключ с политикой
+    reg.deleteKey(root, ruleName);
+    
+    return true;
+  } catch (e) {
+    console.error('Error deleting QoS policy:', e);
+    throw e;
+  } finally {
+    if (root) reg.closeKey(root);
+  }
+}
+
+async function createQoSPolicy(policyData) {
+  if (!isAdmin()) {
+    throw new Error('Требуются права администратора для создания политик');
+  }
+
+  // Проверяем, что имя правила задано
+  if (!policyData.Rule || policyData.Rule.trim() === '') {
+    throw new Error('Имя правила не может быть пустым');
+  }
+
+  // Используем функцию обновления для создания
+  return updateQoSPolicy(policyData);
 }
 
 // IPC handlers
@@ -242,7 +406,7 @@ ipcMain.handle('get-qos-policies', async () => {
     return { ok: true, items: data };
   } catch (e) {
     console.error('Error collecting QoS policies:', e);
-    return { ok: false, error: String(e) };
+    return { ok: false, error: String(e.message || e) };
   }
 });
 
@@ -256,8 +420,36 @@ ipcMain.handle('update-qos-policy', async (event, policyData) => {
     }
   } catch (e) {
     console.error('Error updating QoS policy:', e);
-    return { ok: false, error: String(e) };
+    return { ok: false, error: String(e.message || e) };
   }
+});
+
+ipcMain.handle('delete-qos-policy', async (event, ruleName, regView) => {
+  try {
+    await deleteQoSPolicy(ruleName, regView);
+    return { ok: true };
+  } catch (e) {
+    console.error('Error deleting QoS policy:', e);
+    return { ok: false, error: String(e.message || e) };
+  }
+});
+
+ipcMain.handle('create-qos-policy', async (event, policyData) => {
+  try {
+    const success = await createQoSPolicy(policyData);
+    if (success) {
+      return { ok: true };
+    } else {
+      return { ok: false, error: 'Не удалось создать политику' };
+    }
+  } catch (e) {
+    console.error('Error creating QoS policy:', e);
+    return { ok: false, error: String(e.message || e) };
+  }
+});
+
+ipcMain.handle('check-admin', async () => {
+  return isAdmin();
 });
 
 // IPC для управления окном
@@ -269,7 +461,12 @@ ipcMain.handle('reset-window-bounds', () => {
   store.delete('windowBounds');
   const win = BrowserWindow.getFocusedWindow();
   if (win) {
-    win.setBounds({ width: 1200, height: 800 });
+    win.setBounds({ width: 1400, height: 800 });
     win.center();
   }
+});
+
+// Открытие внешних ссылок
+ipcMain.handle('open-external', async (event, url) => {
+  shell.openExternal(url);
 });
