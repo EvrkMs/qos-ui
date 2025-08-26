@@ -5,6 +5,7 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { exec } = require('child_process');
 
 // ---------- Окно ----------
@@ -142,6 +143,28 @@ function parseRegQuery(stdout) {
   return res;
 }
 
+function psEscape(str) {
+  return String(str).replace(/'/g, "''");
+}
+
+function checkAdminNetSession() {
+  return new Promise((resolve) => {
+    exec('net session', { windowsHide: true }, (err) => resolve(!err));
+  });
+}
+
+async function runPowerShell(script) {
+  const tmp = path.join(os.tmpdir(), `qos_${Date.now()}.ps1`);
+  fs.writeFileSync(tmp, script, 'utf8');
+  return new Promise((resolve) => {
+    exec(`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${tmp}"`, { windowsHide: true, timeout: 60000 }, (err, stdout, stderr) => {
+      fs.unlink(tmp, () => {});
+      if (err) resolve({ ok: false, stdout, stderr: stderr || err.message });
+      else resolve({ ok: true, stdout, stderr: '' });
+    });
+  });
+}
+
 async function listRulesRegExe(hive, view) {
   const root = `${hive}\\Software\\Policies\\Microsoft\\Windows\\QoS`;
   const out = await execReg(`reg query "${root}" /reg:${view}`);
@@ -270,6 +293,21 @@ async function deleteKeyRegExe(hive, view, rule) {
   if (!out.ok) throw new Error(out.stderr || 'reg delete failed');
 }
 
+async function cleanRegistry(rule) {
+  const hives = [HIVES.HKLM, HIVES.HKCU];
+  const views = ['64', '32'];
+  for (const hive of hives) {
+    for (const view of views) {
+      try {
+        if (nreg) await deleteKeyNative(hive, view, rule);
+        else await deleteKeyRegExe(hive, view, rule);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
 async function createOrUpdatePolicy(data, isCreate = false) {
   // Ожидаем поля: Rule, regView ('64'|'32'), hive (optional, default HKLM), + все значения строками
   const rule   = strOr(data.Rule).trim();
@@ -357,6 +395,99 @@ ipcMain.handle('update-policy', async (_evt, data) => {
 ipcMain.handle('delete-policy', async (_evt, { Rule, regView, hive }) => {
   try {
     return await deletePolicy({ Rule, regView, hive });
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+});
+
+ipcMain.handle('open-qos-wizard', async () => {
+  return new Promise((resolve) => {
+    exec('gpedit.msc', { windowsHide: true }, (err) => {
+      if (err) resolve({ ok: false, error: String(err) });
+      else resolve({ ok: true });
+    });
+  });
+});
+
+ipcMain.handle('add-qos-policy-win', async (_evt, form) => {
+  try {
+    const admin = await checkAdminNetSession();
+    if (!admin) return { ok: false, error: 'Требуются права администратора' };
+
+    const name = String(form.Name || '').trim();
+    if (!name) return { ok: false, error: 'Name обязателен' };
+
+    const params = [`-Name '${psEscape(name)}'`];
+
+    if (form.DSCPValue !== undefined && form.DSCPValue !== '') {
+      let dscp = parseInt(form.DSCPValue, 10);
+      if (!isNaN(dscp)) {
+        dscp = Math.max(0, Math.min(63, dscp));
+        params.push(`-DSCPAction ${dscp}`);
+      }
+    }
+
+    if (form.ThrottleRate !== undefined && form.ThrottleRate !== '') {
+      const rate = parseFloat(form.ThrottleRate);
+      if (!isNaN(rate) && rate > 0) {
+        const bps = Math.round(rate * 1000 * 8);
+        params.push(`-ThrottleRateActionBitsPerSecond ${bps}`);
+      }
+    }
+
+    if (form.ApplicationName) {
+      params.push(`-AppPathNameMatchCondition '${psEscape(form.ApplicationName)}'`);
+    }
+
+    if (form.Protocol === 'TCP' || form.Protocol === 'UDP') {
+      params.push(`-IPProtocolMatchCondition ${form.Protocol}`);
+    }
+
+    const portVal = form.LocalPort || form.RemotePort;
+    if (portVal) {
+      const pn = parseInt(portVal, 10);
+      if (!isNaN(pn) && pn >= 1 && pn <= 65535) {
+        params.push(`-IPPortMatchCondition ${pn}`);
+      }
+    }
+
+    if (form.LocalIP && form.LocalIPPrefixLength) {
+      params.push(`-IPSrcPrefixMatchCondition '${psEscape(form.LocalIP + '/' + form.LocalIPPrefixLength)}'`);
+    }
+
+    if (form.RemoteIP && form.RemoteIPPrefixLength) {
+      params.push(`-IPDstPrefixMatchCondition '${psEscape(form.RemoteIP + '/' + form.RemoteIPPrefixLength)}'`);
+    }
+
+    const profile = form.NetworkProfile || 'All';
+    params.push(`-NetworkProfile ${profile}`);
+
+    const store = form.PolicyStore || 'localhost';
+    params.push(`-PolicyStore '${psEscape(store)}'`);
+
+    const cmd = `New-NetQosPolicy ${params.join(' ')}`;
+    const script = `${cmd}\nGet-NetQosPolicy -Name '${psEscape(name)}' -PolicyStore ActiveStore | Format-List *\n`;
+    const out = await runPowerShell(script);
+    if (!out.ok) return { ok: false, error: out.stderr, stdout: out.stdout };
+    return { ok: true, stdout: out.stdout };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+});
+
+ipcMain.handle('remove-qos-policy-win', async (_evt, { Name }) => {
+  try {
+    const admin = await checkAdminNetSession();
+    if (!admin) return { ok: false, error: 'Требуются права администратора' };
+    const name = String(Name || '').trim();
+    if (!name) return { ok: false, error: 'Name обязателен' };
+
+    const script = `\nRemove-NetQosPolicy -Name '${psEscape(name)}' -PolicyStore localhost -ErrorAction SilentlyContinue\nRemove-NetQosPolicy -Name '${psEscape(name)}' -PolicyStore "GPO:localhost" -ErrorAction SilentlyContinue\nRemove-NetQosPolicy -Name '${psEscape(name)}' -PolicyStore ActiveStore -ErrorAction SilentlyContinue\nGet-NetQosPolicy -Name '${psEscape(name)}' -PolicyStore ActiveStore | Format-List *\n`;
+    const out = await runPowerShell(script);
+    await cleanRegistry(name);
+    if (!out.ok) return { ok: false, error: out.stderr || out.error, stdout: out.stdout };
+    const warn = out.stdout && out.stdout.trim() ? 'Правило может управляться доменным GPO и появиться снова' : undefined;
+    return warn ? { ok: true, warning: warn } : { ok: true };
   } catch (e) {
     return { ok: false, error: String(e) };
   }

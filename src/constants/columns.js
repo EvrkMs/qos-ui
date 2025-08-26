@@ -1,0 +1,16 @@
+export const columns = [
+  { id: 'hive', label: 'Hive', minWidth: 60 },
+  { id: 'regView', label: 'View', minWidth: 60 },
+  { id: 'Rule', label: 'Rule Name', minWidth: 150 },
+  { id: 'ApplicationName', label: 'Application', minWidth: 200 },
+  { id: 'DSCPValue', label: 'DSCP', minWidth: 80 },
+  { id: 'ThrottleRate', label: 'Throttle Rate', minWidth: 120 },
+  { id: 'Protocol', label: 'Protocol', minWidth: 80 },
+  { id: 'LocalIP', label: 'Local IP', minWidth: 120 },
+  { id: 'LocalIPPrefixLength', label: 'Prefix', minWidth: 60 },
+  { id: 'LocalPort', label: 'Local Port', minWidth: 100 },
+  { id: 'RemoteIP', label: 'Remote IP', minWidth: 120 },
+  { id: 'RemoteIPPrefixLength', label: 'Prefix', minWidth: 60 },
+  { id: 'RemotePort', label: 'Remote Port', minWidth: 100 },
+  { id: 'actions', label: 'Actions', minWidth: 120 },
+];
