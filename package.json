@@ -1,0 +1,15 @@
+{
+  "name": "qos-viewer-electron",
+  "version": "1.0.0",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^31.0.0"
+  },
+  "dependencies": {
+    "native-reg": "^1.1.1"
+  }
+}

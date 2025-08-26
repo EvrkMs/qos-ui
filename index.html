@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<title>QoS Policies Viewer</title>
+<style>
+  body { font-family: system-ui, Segoe UI, Arial, sans-serif; margin: 16px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #333; padding: 6px 8px; font-size: 13px; }
+  th { position: sticky; top: 0; background: #eee; }
+  #err { color: #c00; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+  <h2>Policy-based QoS (HKLM/HKCU, 32/64)</h2>
+  <div id="err"></div>
+  <table id="tbl"></table>
+  <script src="renderer.js"></script>
+</body>
+</html>
