@@ -1,472 +1,363 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+// main.js — Electron main-process
+// Читает/пишет QoS-политики в реестр. Все значения отдаются СТРОКАМИ.
+// Используем native-reg; если он не доступен — fallback на reg.exe.
+
+const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
-const Store = require('electron-store');
-const reg = require('native-reg');
+const fs = require('fs');
+const { exec } = require('child_process');
 
-// Создаем хранилище для настроек
-const store = new Store();
-
-// Примечание: Все QoS политики в Windows хранятся как строковые значения (REG_SZ),
-// даже числовые параметры как DSCP Value и Throttle Rate
-
-// Проверка прав администратора
-function isAdmin() {
-  try {
-    // Пробуем открыть защищенный ключ для записи
-    const testKey = reg.openKey(
-      reg.HKLM,
-      'SOFTWARE',
-      reg.Access.READ | reg.Access.WOW64_64KEY
-    );
-    if (testKey) {
-      reg.closeKey(testKey);
-      return true;
-    }
-  } catch {
-    return false;
-  }
-  return false;
-}
-
+// ---------- Окно ----------
 function createWindow() {
-  // Получаем сохраненные размеры окна или используем дефолтные
-  const windowBounds = store.get('windowBounds', {
-    width: 1400,
-    height: 800,
-    x: undefined,
-    y: undefined
-  });
-
   const win = new BrowserWindow({
-    ...windowBounds,
-    minWidth: 800,
-    minHeight: 600,
+    width: 1200,
+    height: 800,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
-      nodeIntegration: false,
-      contextIsolation: true
-    },
-    icon: path.join(__dirname, 'icon.ico'), // если есть иконка
-    show: false
+      contextIsolation: true,
+    }
   });
 
-  // Показываем окно когда оно готово
-  win.once('ready-to-show', () => {
-    win.show();
-  });
-
-  win.loadFile('dist/index.html');
-
-  // Сохраняем размеры окна при изменении
-  win.on('resize', () => {
-    store.set('windowBounds', win.getBounds());
-  });
-
-  // Сохраняем позицию окна при перемещении
-  win.on('move', () => {
-    store.set('windowBounds', win.getBounds());
-  });
-
-  // Открыть DevTools в режиме разработки
-  if (process.env.NODE_ENV === 'development') {
-    win.webContents.openDevTools();
-  }
-
-  // Проверяем права администратора
-  if (!isAdmin()) {
-    dialog.showMessageBoxSync(win, {
-      type: 'warning',
-      title: 'Требуются права администратора',
-      message: 'Для редактирования и удаления QoS политик требуются права администратора.\nЧтение политик доступно в обычном режиме.',
-      buttons: ['OK']
-    });
-  }
-
-  return win;
+  // Грузим dist/index.html если есть; иначе src/index.html (dev)
+  const distHtml = path.join(__dirname, 'dist', 'index.html');
+  const srcHtml  = path.join(__dirname, 'src', 'index.html');
+  win.loadFile(fs.existsSync(distHtml) ? distHtml : srcHtml);
 }
 
 app.whenReady().then(() => {
   createWindow();
-  
-  app.on('activate', () => { 
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow(); 
-    }
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
-
-app.on('window-all-closed', () => { 
-  if (process.platform !== 'darwin') {
-    app.quit(); 
-  }
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
 });
 
-// --- QoS Registry helpers ---
+// ---------- helpers ----------
+let nreg = null;
+try { nreg = require('native-reg'); } catch { nreg = null; }
 
-// Получение строкового значения из реестра
-function getStr(hkey, valueName) {
+const HIVES = {
+  HKLM: 'HKLM',
+  HKCU: 'HKCU',
+};
+
+// Безопасно читаем REG_SZ как строку
+function readSzNative(hKey, valueName) {
   try {
-    const val = reg.queryValue(hkey, valueName);
-    const parsed = reg.parseValue(val);
-    return parsed !== null && parsed !== undefined ? String(parsed) : '';
+    const raw = nreg.queryValue(hKey, valueName);
+    if (raw == null) return '';
+    if (typeof raw === 'string') return raw;
+    if (typeof raw === 'object') {
+      if ('data' in raw && Buffer.isBuffer(raw.data)) {
+        return raw.data.toString('utf16le').replace(/\u0000+$/g, '');
+      }
+      if ('value' in raw) return String(raw.value ?? '');
+    }
+    return String(raw);
   } catch {
     return '';
   }
 }
 
-// Запись строкового значения в реестр
-function setStr(hkey, valueName, value) {
-  try {
-    // Если значение пустое или '*', удаляем параметр
-    if (!value || value === '*' || value === '') {
-      try {
-        reg.deleteValue(hkey, valueName);
-      } catch {
-        // Игнорируем ошибку если значения не существует
+function accessMask(view /* '64' | '32' */, write = false) {
+  const base = write ? nreg.Access.ALL_ACCESS : nreg.Access.READ;
+  const wow  = (view === '64') ? nreg.Access.WOW64_64KEY : nreg.Access.WOW64_32KEY;
+  return base | wow;
+}
+
+function openRoot(hive, view, write = false) {
+  const rootHive = hive === 'HKCU' ? nreg.HKCU : nreg.HKLM;
+  return nreg.openKey(rootHive, 'Software\\Policies\\Microsoft\\Windows\\QoS', accessMask(view, write));
+}
+
+function listRulesNative(hive, view) {
+  const root = openRoot(hive, view, false);
+  if (!root) return [];
+  const names = nreg.enumKeyNames(root) || [];
+  nreg.closeKey(root);
+  return names;
+}
+
+function readRuleNative(hive, view, rule) {
+  const root = openRoot(hive, view, false);
+  if (!root) return null;
+  const hRule = nreg.openKey(root, rule, accessMask(view, false));
+  nreg.closeKey(root);
+  if (!hRule) return null;
+
+  const obj = {
+    hive,
+    regView: view,
+    Rule: rule,
+    keyPath: `${hive}\\Software\\Policies\\Microsoft\\Windows\\QoS\\${rule}`,
+    ApplicationName: readSzNative(hRule, 'Application Name'),
+    DSCPValue:       readSzNative(hRule, 'DSCP Value'),
+    ThrottleRate:    readSzNative(hRule, 'Throttle Rate'),
+    Protocol:        readSzNative(hRule, 'Protocol'),
+    LocalIP:         readSzNative(hRule, 'Local IP'),
+    LocalIPPrefixLength: readSzNative(hRule, 'Local IP Prefix Length'),
+    LocalPort:       readSzNative(hRule, 'Local Port'),
+    RemoteIP:        readSzNative(hRule, 'Remote IP'),
+    RemoteIPPrefixLength: readSzNative(hRule, 'Remote IP Prefix Length'),
+    RemotePort:      readSzNative(hRule, 'Remote Port'),
+    Version:         readSzNative(hRule, 'Version'),
+  };
+  nreg.closeKey(hRule);
+  return obj;
+}
+
+// ---- Fallback на reg.exe ----
+function execReg(cmd) {
+  return new Promise((resolve) => {
+    exec(cmd, { windowsHide: true }, (err, stdout, stderr) => {
+      if (err) resolve({ ok: false, stdout, stderr: stderr || err.message });
+      else resolve({ ok: true, stdout, stderr: '' });
+    });
+  });
+}
+
+function parseRegQuery(stdout) {
+  // Разбираем блоки вида:
+  // HKEY_...\QoS\Rule
+  //     ValueName   REG_SZ   Value
+  const lines = String(stdout).split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const res = [];
+  let cur = null;
+  for (const line of lines) {
+    if (/^HKEY_/.test(line)) {
+      if (cur) res.push(cur);
+      cur = { path: line, values: {} };
+    } else if (cur) {
+      const m = line.match(/^(.+?)\s+REG_[A-Z0-9]+\s+(.+)$/);
+      if (m) {
+        const name = m[1].trim();
+        const val  = m[2].trim();
+        cur.values[name] = val;
       }
-      return true;
     }
-    reg.setValueSZ(hkey, valueName, String(value));
-    return true;
-  } catch (e) {
-    console.error(`Error setting ${valueName}:`, e);
-    return false;
   }
+  if (cur) res.push(cur);
+  return res;
 }
 
-// Запись DWORD значения в реестр
-function setDWord(hkey, valueName, value) {
-  try {
-    const numValue = parseInt(value, 10);
-    if (isNaN(numValue)) {
-      // Если не число, удаляем параметр
+async function listRulesRegExe(hive, view) {
+  const root = `${hive}\\Software\\Policies\\Microsoft\\Windows\\QoS`;
+  const out = await execReg(`reg query "${root}" /reg:${view}`);
+  if (!out.ok) return [];
+  const lines = out.stdout.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  return lines.filter(l => l.startsWith(root + '\\')).map(s => s.split('\\').pop());
+}
+
+async function readRuleRegExe(hive, view, rule) {
+  const key = `${hive}\\Software\\Policies\\Microsoft\\Windows\\QoS\\${rule}`;
+  const out = await execReg(`reg query "${key}" /reg:${view}`);
+  if (!out.ok) return null;
+  const blocks = parseRegQuery(out.stdout);
+  const me = blocks.find(b => b.path.toLowerCase() === key.toLowerCase());
+  const v = (me && me.values) ? me.values : {};
+  return {
+    hive,
+    regView: view,
+    Rule: rule,
+    keyPath: key,
+    ApplicationName: v['Application Name'] || '',
+    DSCPValue: v['DSCP Value'] || '',
+    ThrottleRate: v['Throttle Rate'] || '',
+    Protocol: v['Protocol'] || '',
+    LocalIP: v['Local IP'] || '',
+    LocalIPPrefixLength: v['Local IP Prefix Length'] || '',
+    LocalPort: v['Local Port'] || '',
+    RemoteIP: v['Remote IP'] || '',
+    RemoteIPPrefixLength: v['Remote IP Prefix Length'] || '',
+    RemotePort: v['Remote Port'] || '',
+    Version: v['Version'] || ''
+  };
+}
+
+// ---- Общая обвязка чтения ----
+async function collectPolicies() {
+  const result = [];
+  const hives = [HIVES.HKLM, HIVES.HKCU];
+  const views = ['64', '32'];
+
+  const useNative = !!nreg;
+
+  for (const hive of hives) {
+    for (const view of views) {
       try {
-        reg.deleteValue(hkey, valueName);
-      } catch {
-        // Игнорируем ошибку если значения не существует
-      }
-      return true;
-    }
-    reg.setValueDWORD(hkey, valueName, numValue);
-    return true;
-  } catch (e) {
-    console.error(`Error setting ${valueName}:`, e);
-    return false;
-  }
-}
-
-function openQoSRoot(view, access = reg.Access.READ) {
-  const flags = access | (view === '64' ? reg.Access.WOW64_64KEY : reg.Access.WOW64_32KEY);
-  
-  try {
-    const root = reg.openKey(
-      reg.HKLM,
-      'Software\\Policies\\Microsoft\\Windows\\QoS',
-      flags
-    );
-    return root;
-  } catch (e) {
-    console.error(`Failed to open QoS root for view ${view}:`, e);
-    return null;
-  }
-}
-
-async function collectQosPolicies() {
-  const results = [];
-
-  for (const view of ['64', '32']) {
-    const root = openQoSRoot(view);
-    if (!root) continue;
-
-    try {
-      // Получаем список подключей (правил QoS)
-      let ruleNames = [];
-      try {
-        ruleNames = reg.enumKeyNames(root);
-      } catch (e) {
-        console.error(`Failed to enumerate keys for view ${view}:`, e);
-        continue;
-      }
-      
-      for (const ruleName of ruleNames) {
-        const access = reg.Access.READ | (view === '64' ? reg.Access.WOW64_64KEY : reg.Access.WOW64_32KEY);
-
-        try {
-          const hRule = reg.openKey(root, ruleName, access);
-          if (!hRule) continue;
-
-          // Читаем все параметры политики (все значения QoS хранятся как строки!)
-          const policy = {
-            hive: 'HKLM',
-            regView: view,
-            Rule: ruleName,
-            // Все параметры QoS политик хранятся как строковые значения
-            ApplicationName: getStr(hRule, 'Application Name'),
-            DSCPValue: getStr(hRule, 'DSCP Value'),
-            ThrottleRate: getStr(hRule, 'Throttle Rate'),
-            Protocol: getStr(hRule, 'Protocol'),
-            LocalIP: getStr(hRule, 'Local IP'),
-            LocalIPPrefixLength: getStr(hRule, 'Local IP Prefix Length'),
-            LocalPort: getStr(hRule, 'Local Port'),
-            RemoteIP: getStr(hRule, 'Remote IP'),
-            RemoteIPPrefixLength: getStr(hRule, 'Remote IP Prefix Length'),
-            RemotePort: getStr(hRule, 'Remote Port'),
-            Version: getStr(hRule, 'Version'),
-            // Дополнительные поля для UI
-            keyPath: `HKLM\\Software\\Policies\\Microsoft\\Windows\\QoS\\${ruleName}`
-          };
-
-          reg.closeKey(hRule);
-          results.push(policy);
-        } catch (e) {
-          console.error(`Error reading rule ${ruleName}:`, e);
+        const ruleNames = useNative ? listRulesNative(hive, view) : await listRulesRegExe(hive, view);
+        for (const rule of ruleNames) {
+          const obj = useNative ? readRuleNative(hive, view, rule) : await readRuleRegExe(hive, view, rule);
+          if (obj) result.push(obj);
         }
-      }
-    } catch (e) {
-      console.error(`Error processing QoS policies for view ${view}:`, e);
-    } finally {
-      if (root) {
-        reg.closeKey(root);
+      } catch {
+        // проглатываем, просто идём дальше
       }
     }
   }
-
-  return results;
+  return result;
 }
 
-async function updateQoSPolicy(policyData) {
-  if (!isAdmin()) {
-    throw new Error('Требуются права администратора для изменения политик');
-  }
-
-  const view = policyData.regView || '64';
-  const access = reg.Access.WRITE | reg.Access.READ |
-    (view === '64' ? reg.Access.WOW64_64KEY : reg.Access.WOW64_32KEY);
-
-  let root = null;
-  let ruleKey = null;
-
-  try {
-    // Открываем корневой ключ QoS
-    root = reg.openKey(
-      reg.HKLM,
-      'Software\\Policies\\Microsoft\\Windows\\QoS',
-      access
-    );
-
-    if (!root) {
-      throw new Error('Не удается открыть раздел QoS для записи');
-    }
-
-    // Открываем или создаем ключ правила
+// ---- Проверка админ-прав ----
+// Самый надёжный способ — попытка создать/удалить временный ключ в HKLM (требует админа).
+async function checkAdmin() {
+  // Сначала пробуем native-reg
+  if (nreg) {
     try {
-      ruleKey = reg.openKey(root, policyData.Rule, access);
-    } catch {
-      // Если ключ не существует, создаем его
-      try {
-        ruleKey = reg.createKey(root, policyData.Rule, access);
-      } catch (createError) {
-        throw new Error(`Не удается создать ключ правила: ${policyData.Rule}`);
+      const root = nreg.openKey(nreg.HKLM, 'Software', accessMask('64', true));
+      if (root) {
+        const testName = 'qos_ui_admin_test_' + Date.now();
+        const h = nreg.createKey(root, testName, accessMask('64', true));
+        if (h) {
+          nreg.closeKey(h);
+          nreg.deleteKey(root, testName);
+          nreg.closeKey(root);
+          return true;
+        }
+        nreg.closeKey(root);
       }
-    }
-
-    if (!ruleKey) {
-      throw new Error(`Не удается открыть или создать ключ правила: ${policyData.Rule}`);
-    }
-
-    // Записываем значения (все QoS параметры хранятся как строки!)
-    const updates = [];
-    
-    // Application Name - строковое значение
-    if (policyData.ApplicationName !== undefined) {
-      updates.push(setStr(ruleKey, 'Application Name', policyData.ApplicationName || '*'));
-    }
-    
-    // DSCP Value - числовое значение как строка (0-63)
-    if (policyData.DSCPValue !== undefined) {
-      const dscpVal = parseInt(policyData.DSCPValue, 10);
-      if (!isNaN(dscpVal) && dscpVal >= 0 && dscpVal <= 63) {
-        updates.push(setNumAsStr(ruleKey, 'DSCP Value', dscpVal));
-      } else {
-        updates.push(setNumAsStr(ruleKey, 'DSCP Value', 0));
-      }
-    }
-    
-    // Throttle Rate - числовое значение как строка (-1 для unlimited)
-    if (policyData.ThrottleRate !== undefined) {
-      const throttleVal = parseInt(policyData.ThrottleRate, 10);
-      updates.push(setNumAsStr(ruleKey, 'Throttle Rate', isNaN(throttleVal) ? -1 : throttleVal));
-    }
-    
-    // Protocol - строковое значение (TCP, UDP, или *)
-    if (policyData.Protocol !== undefined) {
-      updates.push(setStr(ruleKey, 'Protocol', policyData.Protocol || '*'));
-    }
-    
-    // Local IP - строковое значение
-    if (policyData.LocalIP !== undefined) {
-      updates.push(setStr(ruleKey, 'Local IP', policyData.LocalIP || '*'));
-    }
-    
-    // Local IP Prefix Length - числовое значение как строка
-    if (policyData.LocalIPPrefixLength !== undefined) {
-      updates.push(setNumAsStr(ruleKey, 'Local IP Prefix Length', policyData.LocalIPPrefixLength || 0));
-    }
-    
-    // Local Port - строковое значение или диапазон
-    if (policyData.LocalPort !== undefined) {
-      updates.push(setStr(ruleKey, 'Local Port', policyData.LocalPort || '*'));
-    }
-    
-    // Remote IP - строковое значение
-    if (policyData.RemoteIP !== undefined) {
-      updates.push(setStr(ruleKey, 'Remote IP', policyData.RemoteIP || '*'));
-    }
-    
-    // Remote IP Prefix Length - числовое значение как строка
-    if (policyData.RemoteIPPrefixLength !== undefined) {
-      updates.push(setNumAsStr(ruleKey, 'Remote IP Prefix Length', policyData.RemoteIPPrefixLength || 0));
-    }
-    
-    // Remote Port - строковое значение или диапазон
-    if (policyData.RemotePort !== undefined) {
-      updates.push(setStr(ruleKey, 'Remote Port', policyData.RemotePort || '*'));
-    }
-    
-    // Version - строковое значение
-    if (policyData.Version !== undefined) {
-      updates.push(setStr(ruleKey, 'Version', policyData.Version || '1.0'));
-    }
-
-    const success = updates.every(result => result !== false);
-
-    return success;
-  } catch (e) {
-    console.error('Error updating QoS policy:', e);
-    throw e;
-  } finally {
-    if (ruleKey) reg.closeKey(ruleKey);
-    if (root) reg.closeKey(root);
+    } catch { /* fallthrough */ }
   }
+  // Fallback: "net session" возвращает "Access is denied" без админа
+  const out = await new Promise(resolve => {
+    exec('net session', { windowsHide: true }, (err) => resolve(!err));
+  });
+  return !!out;
 }
 
-async function deleteQoSPolicy(ruleName, regView) {
-  if (!isAdmin()) {
-    throw new Error('Требуются права администратора для удаления политик');
+// ---- Запись/создание/удаление ----
+// Универсальные функции: сначала native-reg, иначе reg.exe
+
+function strOr(val) { return (val === undefined || val === null) ? '' : String(val); }
+
+function writeValueNative(hive, view, rule, name, data) {
+  const root = openRoot(hive, view, true);
+  if (!root) throw new Error('Cannot open QoS root for write');
+  let hRule = nreg.openKey(root, rule, accessMask(view, true));
+  if (!hRule) {
+    hRule = nreg.createKey(root, rule, accessMask(view, true));
   }
-
-  const view = regView || '64';
-  const access = reg.Access.WRITE | reg.Access.READ |
-    (view === '64' ? reg.Access.WOW64_64KEY : reg.Access.WOW64_32KEY);
-
-  let root = null;
-
-  try {
-    // Открываем корневой ключ QoS
-    root = reg.openKey(
-      reg.HKLM,
-      'Software\\Policies\\Microsoft\\Windows\\QoS',
-      access
-    );
-
-    if (!root) {
-      throw new Error('Не удается открыть раздел QoS для удаления');
-    }
-
-    // Удаляем подключ с политикой
-    reg.deleteKey(root, ruleName);
-    
-    return true;
-  } catch (e) {
-    console.error('Error deleting QoS policy:', e);
-    throw e;
-  } finally {
-    if (root) reg.closeKey(root);
-  }
+  // Пишем REG_SZ
+  nreg.setValue(hRule, name, nreg.REG_SZ, String(data));
+  nreg.closeKey(hRule);
+  nreg.closeKey(root);
 }
 
-async function createQoSPolicy(policyData) {
-  if (!isAdmin()) {
-    throw new Error('Требуются права администратора для создания политик');
-  }
-
-  // Проверяем, что имя правила задано
-  if (!policyData.Rule || policyData.Rule.trim() === '') {
-    throw new Error('Имя правила не может быть пустым');
-  }
-
-  // Используем функцию обновления для создания
-  return updateQoSPolicy(policyData);
+async function writeValueRegExe(hive, view, rule, name, data) {
+  const key = `${hive}\\Software\\Policies\\Microsoft\\Windows\\QoS\\${rule}`;
+  // Создаём подключ (тихий повторяемый)
+  await execReg(`reg add "${key}" /f /reg:${view}`);
+  // Ставим REG_SZ
+  const cmd = `reg add "${key}" /v "${name}" /t REG_SZ /d "${String(data)}" /f /reg:${view}`;
+  const out = await execReg(cmd);
+  if (!out.ok) throw new Error(out.stderr || 'reg add failed');
 }
 
-// IPC handlers
-ipcMain.handle('get-qos-policies', async () => {
-  try {
-    const data = await collectQosPolicies();
-    return { ok: true, items: data };
-  } catch (e) {
-    console.error('Error collecting QoS policies:', e);
-    return { ok: false, error: String(e.message || e) };
-  }
-});
+async function deleteKeyNative(hive, view, rule) {
+  const rootHive = (hive === 'HKCU') ? nreg.HKCU : nreg.HKLM;
+  const root = nreg.openKey(rootHive, 'Software\\Policies\\Microsoft\\Windows\\QoS', accessMask(view, true));
+  if (!root) throw new Error('Cannot open QoS root for delete');
+  const ok = nreg.deleteKey(root, rule);
+  nreg.closeKey(root);
+  if (!ok) throw new Error('deleteKey failed');
+}
 
-ipcMain.handle('update-qos-policy', async (event, policyData) => {
-  try {
-    const success = await updateQoSPolicy(policyData);
-    if (success) {
-      return { ok: true };
-    } else {
-      return { ok: false, error: 'Не удалось обновить все значения политики' };
+async function deleteKeyRegExe(hive, view, rule) {
+  const key = `${hive}\\Software\\Policies\\Microsoft\\Windows\\QoS\\${rule}`;
+  const out = await execReg(`reg delete "${key}" /f /reg:${view}`);
+  if (!out.ok) throw new Error(out.stderr || 'reg delete failed');
+}
+
+async function createOrUpdatePolicy(data, isCreate = false) {
+  // Ожидаем поля: Rule, regView ('64'|'32'), hive (optional, default HKLM), + все значения строками
+  const rule   = strOr(data.Rule).trim();
+  const view   = (data.regView === '32') ? '32' : '64';
+  const hive   = (data.hive === 'HKCU') ? 'HKCU' : 'HKLM';
+
+  if (!rule) throw new Error('Имя правила (Rule) не задано');
+
+  const writeKv = async (name, value) => {
+    if (nreg) writeValueNative(hive, view, rule, name, strOr(value));
+    else await writeValueRegExe(hive, view, rule, name, strOr(value));
+  };
+
+  // Пишем только те значения, что пришли из формы (все — REG_SZ)
+  const fields = {
+    'Application Name': data.ApplicationName,
+    'DSCP Value':       data.DSCPValue,
+    'Throttle Rate':    data.ThrottleRate,
+    'Protocol':         data.Protocol,
+    'Local IP':         data.LocalIP,
+    'Local IP Prefix Length': data.LocalIPPrefixLength,
+    'Local Port':       data.LocalPort,
+    'Remote IP':        data.RemoteIP,
+    'Remote IP Prefix Length': data.RemoteIPPrefixLength,
+    'Remote Port':      data.RemotePort,
+    'Version':          data.Version,
+  };
+
+  for (const [k, v] of Object.entries(fields)) {
+    if (v !== undefined) {
+      // ВАЖНО: всегда строка
+      await writeKv(k, strOr(v));
     }
-  } catch (e) {
-    console.error('Error updating QoS policy:', e);
-    return { ok: false, error: String(e.message || e) };
   }
-});
 
-ipcMain.handle('delete-qos-policy', async (event, ruleName, regView) => {
-  try {
-    await deleteQoSPolicy(ruleName, regView);
-    return { ok: true };
-  } catch (e) {
-    console.error('Error deleting QoS policy:', e);
-    return { ok: false, error: String(e.message || e) };
-  }
-});
+  return { ok: true };
+}
 
-ipcMain.handle('create-qos-policy', async (event, policyData) => {
+async function deletePolicy({ Rule, regView, hive }) {
+  const rule = strOr(Rule).trim();
+  const view = (regView === '32') ? '32' : '64';
+  const hv   = (hive === 'HKCU') ? 'HKCU' : 'HKLM';
+  if (!rule) throw new Error('Rule пуст');
+
+  if (nreg) await deleteKeyNative(hv, view, rule);
+  else await deleteKeyRegExe(hv, view, rule);
+  return { ok: true };
+}
+
+// ---------- IPC ----------
+ipcMain.handle('get-policies', async () => {
   try {
-    const success = await createQoSPolicy(policyData);
-    if (success) {
-      return { ok: true };
-    } else {
-      return { ok: false, error: 'Не удалось создать политику' };
-    }
+    const items = await collectPolicies();
+    return { ok: true, items };
   } catch (e) {
-    console.error('Error creating QoS policy:', e);
-    return { ok: false, error: String(e.message || e) };
+    return { ok: false, error: String(e) };
   }
 });
 
 ipcMain.handle('check-admin', async () => {
-  return isAdmin();
-});
-
-// IPC для управления окном
-ipcMain.handle('get-window-bounds', () => {
-  return store.get('windowBounds');
-});
-
-ipcMain.handle('reset-window-bounds', () => {
-  store.delete('windowBounds');
-  const win = BrowserWindow.getFocusedWindow();
-  if (win) {
-    win.setBounds({ width: 1400, height: 800 });
-    win.center();
+  try {
+    const res = await checkAdmin();
+    return res;
+  } catch {
+    return false;
   }
 });
 
-// Открытие внешних ссылок
-ipcMain.handle('open-external', async (event, url) => {
-  shell.openExternal(url);
+ipcMain.handle('create-policy', async (_evt, data) => {
+  try {
+    return await createOrUpdatePolicy(data, true);
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+});
+
+ipcMain.handle('update-policy', async (_evt, data) => {
+  try {
+    return await createOrUpdatePolicy(data, false);
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+});
+
+ipcMain.handle('delete-policy', async (_evt, { Rule, regView, hive }) => {
+  try {
+    return await deletePolicy({ Rule, regView, hive });
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
 });
