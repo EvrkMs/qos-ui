@@ -22,7 +22,11 @@ import {
   IconButton,
   Chip,
   Button,
-  Fab
+  Fab,
+  Menu,
+  MenuItem,
+  ListItemIcon,
+  ListItemText
 } from '@mui/material';
 import {
   Search as SearchIcon,
@@ -59,6 +63,7 @@ function App() {
   const [editForm, setEditForm] = useState({});
   const [saving, setSaving] = useState(false);
   const [snackbar, setSnackbar] = useState({ open: false, message: '', severity: 'success' });
+  const [addMenuAnchor, setAddMenuAnchor] = useState(null);
 
   // Проверка прав администратора
   const checkAdminRights = async () => {
@@ -246,10 +251,12 @@ function App() {
   const handleConfirmDelete = async () => {
     setSaving(true);
     try {
-      const result = await window.qosApi.deletePolicy(currentPolicy.Rule, currentPolicy.regView);
-      
+      const result = await window.qosApi.removeQosPolicyWin(currentPolicy.Rule);
+
       if (result.ok) {
-        setSnackbar({ open: true, message: 'Политика успешно удалена', severity: 'success' });
+        const msg = result.warning ? `Политика удалена: ${result.warning}` : 'Политика успешно удалена';
+        const sev = result.warning ? 'warning' : 'success';
+        setSnackbar({ open: true, message: msg, severity: sev });
         handleCloseDelete();
         await loadPolicies();
       } else {
@@ -263,7 +270,28 @@ function App() {
   };
 
   // Функции для создания
-  const handleCreate = () => {
+  const handleAddClick = (event) => {
+    setAddMenuAnchor(event.currentTarget);
+  };
+
+  const handleAddClose = () => {
+    setAddMenuAnchor(null);
+  };
+
+  const handleOpenWizard = async () => {
+    handleAddClose();
+    try {
+      const res = await window.qosApi.openQosWizard();
+      if (!res.ok) {
+        setSnackbar({ open: true, message: res.error || 'Не удалось открыть мастер QoS', severity: 'error' });
+      }
+    } catch (err) {
+      setSnackbar({ open: true, message: `Ошибка: ${err.message}`, severity: 'error' });
+    }
+  };
+
+  const handleOpenCreateDialog = () => {
+    handleAddClose();
     setEditForm({
       Rule: '',
       ApplicationName: '*',
@@ -295,7 +323,8 @@ function App() {
 
     setSaving(true);
     try {
-      const result = await window.qosApi.createPolicy(editForm);
+      const payload = { ...editForm, Name: editForm.Rule };
+      const result = await window.qosApi.addQosPolicyWin(payload);
       
       if (result.ok) {
         setSnackbar({ open: true, message: 'Политика успешно создана', severity: 'success' });
@@ -454,7 +483,7 @@ function App() {
                 <Button 
                   variant="contained" 
                   startIcon={<AddIcon />} 
-                  onClick={handleCreate}
+                  onClick={handleOpenCreateDialog}
                   sx={{ mt: 2 }}
                 >
                   Создать политику
@@ -466,14 +495,30 @@ function App() {
 
         {/* Кнопка добавления */}
         {isAdmin && filteredPolicies.length > 0 && (
-          <Fab 
-            color="primary" 
+          <Fab
+            color="primary"
             aria-label="add"
             sx={{ position: 'fixed', bottom: 16, right: 16 }}
-            onClick={handleCreate}
+            onClick={handleAddClick}
           >
             <AddIcon />
           </Fab>
+        )}
+        {isAdmin && (
+          <Menu anchorEl={addMenuAnchor} open={Boolean(addMenuAnchor)} onClose={handleAddClose}>
+            <MenuItem onClick={handleOpenWizard}>
+              <ListItemIcon>
+                <SettingsIcon fontSize="small" />
+              </ListItemIcon>
+              <ListItemText>Открыть мастер QoS</ListItemText>
+            </MenuItem>
+            <MenuItem onClick={handleOpenCreateDialog}>
+              <ListItemIcon>
+                <AddIcon fontSize="small" />
+              </ListItemIcon>
+              <ListItemText>Создать правило (PowerShell)</ListItemText>
+            </MenuItem>
+          </Menu>
         )}
 
         <EditPolicyDialog

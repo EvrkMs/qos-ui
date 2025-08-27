@@ -9,4 +9,7 @@ contextBridge.exposeInMainWorld('qosApi', {
   updatePolicy: (data) => ipcRenderer.invoke('update-policy', data),
   deletePolicy: (rule, regView, hive = 'HKLM') =>
     ipcRenderer.invoke('delete-policy', { Rule: rule, regView, hive }),
+  openQosWizard: () => ipcRenderer.invoke('open-qos-wizard'),
+  addQosPolicyWin: (data) => ipcRenderer.invoke('add-qos-policy-win', data),
+  removeQosPolicyWin: (name) => ipcRenderer.invoke('remove-qos-policy-win', { Name: name }),
 });
