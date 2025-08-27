@@ -482,7 +482,11 @@ ipcMain.handle('remove-qos-policy-win', async (_evt, { Name }) => {
     const name = String(Name || '').trim();
     if (!name) return { ok: false, error: 'Name обязателен' };
 
-    const script = `\nRemove-NetQosPolicy -Name '${psEscape(name)}' -PolicyStore localhost -ErrorAction SilentlyContinue\nRemove-NetQosPolicy -Name '${psEscape(name)}' -PolicyStore "GPO:localhost" -ErrorAction SilentlyContinue\nRemove-NetQosPolicy -Name '${psEscape(name)}' -PolicyStore ActiveStore -ErrorAction SilentlyContinue\nGet-NetQosPolicy -Name '${psEscape(name)}' -PolicyStore ActiveStore | Format-List *\n`;
+    const script = `\n` +
+      `Remove-NetQosPolicy -Name '${psEscape(name)}' -PolicyStore localhost -Confirm:$false -ErrorAction SilentlyContinue\n` +
+      `Remove-NetQosPolicy -Name '${psEscape(name)}' -PolicyStore "GPO:localhost" -Confirm:$false -ErrorAction SilentlyContinue\n` +
+      `Remove-NetQosPolicy -Name '${psEscape(name)}' -PolicyStore ActiveStore -Confirm:$false -ErrorAction SilentlyContinue\n` +
+      `Get-NetQosPolicy -Name '${psEscape(name)}' -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Format-List *\n`;
     const out = await runPowerShell(script);
     await cleanRegistry(name);
     if (!out.ok) return { ok: false, error: out.stderr || out.error, stdout: out.stdout };
