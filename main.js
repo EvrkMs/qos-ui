@@ -401,53 +401,6 @@ ipcMain.handle('delete-policy', async (_evt, { Rule, regView, hive }) => {
   catch (e) { return { ok: false, error: String(e) }; }
 });
 
-// --- NEW: открыть мастер Policy-based QoS
-ipcMain.handle('open-qos-wizard', async () => {
-  try {
-    exec('gpedit.msc', { windowsHide: true });
-    return { ok: true };
-  } catch (e) {
-    return { ok: false, error: String(e) };
-  }
-});
-
-// --- NEW: добавить правило через PowerShell New-NetQosPolicy
-ipcMain.handle('add-qos-policy-win', async (_evt, form) => {
-  try {
-    // Минимум — имя
-    if (!form || !form.Name) return { ok:false, error:'Не задано имя правила (Name).' };
-
-    // Требуются админ-права
-    const admin = await isAdmin();
-    if (!admin) return { ok:false, error:'Нужны права администратора. Запусти приложение от имени администратора.' };
-
-    const p = {
-      Name:               String(form.Name || form.Rule),
-      DSCPValue:          String(form.DSCPValue || ''),
-      ThrottleRate:       String(form.ThrottleRate || ''),
-      ApplicationName:    String(form.ApplicationName || ''),
-      Protocol:           String(form.Protocol || ''),
-      LocalIP:            String(form.LocalIP || ''),
-      LocalIPPrefixLength:String(form.LocalIPPrefixLength || ''),
-      LocalPort:          String(form.LocalPort || ''),
-      RemoteIP:           String(form.RemoteIP || ''),
-      RemoteIPPrefixLength:String(form.RemoteIPPrefixLength || ''),
-      RemotePort:         String(form.RemotePort || ''),
-      NetworkProfile:     String(form.NetworkProfile || 'All'),
-      // Чтобы правило отображалось именно в Local GPO (gpedit), можно передать из UI: 'GPO:localhost'
-      PolicyStore:        String(form.PolicyStore || 'localhost'),
-    };
-
-    const ps = buildNewPolicyPs(p);
-    const res = await runPowershellScript(ps);
-    if (!res.ok) return { ok:false, error: res.stderr || 'PowerShell error', stdout: res.stdout };
-
-    return { ok:true, stdout: res.stdout };
-  } catch (e) {
-    return { ok:false, error:String(e) };
-  }
-});
-
 ipcMain.handle('open-qos-wizard', async () => {
   return new Promise((resolve) => {
     exec('gpedit.msc', { windowsHide: true }, (err) => {
