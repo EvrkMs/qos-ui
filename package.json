@@ -6,27 +6,68 @@
   "scripts": {
     "start": "electron .",
     "build-renderer": "webpack --mode=production",
-    "dev": "webpack --mode=development --watch"
+    "dev": "webpack --mode=development --watch",
+    "pack": "electron-builder --dir",
+    "dist": "npm run build-renderer && electron-builder --win nsis",
+    "dist:portable": "npm run build-renderer && electron-builder --win portable",
+    "dist:zip": "npm run build-renderer && electron-builder --win zip"
   },
   "devDependencies": {
-    "electron": "^31.0.0",
     "@babel/core": "^7.23.0",
     "@babel/preset-react": "^7.22.0",
     "babel-loader": "^9.1.0",
     "css-loader": "^6.8.0",
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3",
     "html-webpack-plugin": "^5.5.0",
     "style-loader": "^3.3.0",
     "webpack": "^5.88.0",
     "webpack-cli": "^5.1.0"
   },
   "dependencies": {
-    "native-reg": "^1.1.1",
-    "electron-store": "^8.1.0",
-    "@mui/material": "^5.14.20",
     "@emotion/react": "^11.11.1",
     "@emotion/styled": "^11.11.0",
     "@mui/icons-material": "^5.14.19",
+    "@mui/material": "^5.14.20",
+    "electron-store": "^8.1.0",
+    "native-reg": "^1.1.1",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
+  },
+  "build": {
+    "appId": "com.qos.viewer",
+    "productName": "QoS Policies Manager",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "dist/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "npmRebuild": true,
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "runAfterFinish": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "QoS Policies Manager"
+    }
   }
 }

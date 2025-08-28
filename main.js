@@ -102,6 +102,17 @@ function readRuleNative(hive, view, rule) {
   return obj;
 }
 
+// -------------------- Adapters: native vs reg.exe --------------------
+async function listRulesCompat(hive, view) {
+  if (nreg) return listRulesNative(hive, view);
+  return await listRulesRegExe(hive, view);
+}
+
+async function readRuleCompat(hive, view, rule) {
+  if (nreg) return readRuleNative(hive, view, rule);
+  return await readRuleRegExe(hive, view, rule);
+}
+
 // -------------------- Fallback: reg.exe --------------------
 function execReg(cmd) {
   return new Promise((resolve) => {
@@ -190,14 +201,14 @@ async function collectPolicies() {
   const result = [];
   const hives = [HIVES.HKLM, HIVES.HKCU];
   const views = ['64', '32'];
-  const useNative = !!nreg;
+  // Using compat helpers; native-reg if available
 
   for (const hive of hives) {
     for (const view of views) {
       try {
-        const ruleNames = useNative ? listRulesNative(hive, view) : await listRulesRegExe(hive, view);
+        const ruleNames = await listRulesCompat(hive, view);
         for (const rule of ruleNames) {
-          const obj = useNative ? readRuleNative(hive, view, rule) : await readRuleRegExe(hive, view, rule);
+          const obj = await readRuleCompat(hive, view, rule);
           if (obj) result.push(obj);
         }
       } catch {
@@ -209,11 +220,7 @@ async function collectPolicies() {
 }
 
 // -------------------- Админ-права --------------------
-async function isAdmin() {
-  return await new Promise(res => {
-    exec('net session', { windowsHide: true }, (err) => res(!err));
-  });
-}
+
 
 // -------------------- Запись/CRUD через реестр (как было) --------------------
 function strOr(val) { return (val === undefined || val === null) ? '' : String(val); }
@@ -266,7 +273,7 @@ async function cleanRegistry(rule) {
   }
 }
 
-async function createOrUpdatePolicy(data, isCreate = false) {
+async function createOrUpdatePolicy(data) {
   // Ожидаем поля: Rule, regView ('64'|'32'), hive (optional, default HKLM), + все значения строками
   const rule   = strOr(data.Rule).trim();
   const view   = (data.regView === '32') ? '32' : '64';
@@ -360,20 +367,6 @@ function buildNewPolicyPs(p) {
   return lines.join(os.EOL);
 }
 
-function runPowershellScript(psCode) {
-  return new Promise((resolve) => {
-    const tmp = path.join(os.tmpdir(), `qos_add_${Date.now()}.ps1`);
-    fs.writeFileSync(tmp, psCode, 'utf8');
-    execFile('powershell.exe',
-      ['-NoProfile','-ExecutionPolicy','Bypass','-File', tmp],
-      { windowsHide: true, timeout: 60_000 },
-      (err, stdout, stderr) => {
-        try { fs.unlinkSync(tmp); } catch {}
-        if (err) resolve({ ok:false, stdout:String(stdout||''), stderr:String(stderr||err.message) });
-        else     resolve({ ok:true,  stdout:String(stdout||''), stderr:String(stderr||'') });
-      });
-  });
-}
 
 // -------------------- IPC --------------------
 ipcMain.handle('get-policies', async () => {
@@ -382,7 +375,7 @@ ipcMain.handle('get-policies', async () => {
 });
 
 ipcMain.handle('check-admin', async () => {
-  try { return await isAdmin(); }
+  try { return await checkAdminNetSession(); }
   catch { return false; }
 });
 
